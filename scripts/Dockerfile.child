@@ -1,0 +1,42 @@
+# Project TradeJack: Sovereign Child Dockerfile for Grace Blackwell (CUDA 13)
+# Base image optimized for NVIDIA Blackwell unified memory architecture
+FROM nvcr.io/nvidia/pytorch:24.03-py3
+
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
+ENV DEBIAN_FRONTEND=noninteractive
+
+# System dependencies and Git for self-modification checkpoints
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git \
+    curl \
+    build-essential \
+    sqlite3 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Set up working directory
+WORKDIR /workspace
+
+# Install high-throughput quantitative libraries & RAPIDS KvikIO / Polars / vLLM
+RUN pip install --no-cache-dir \
+    polars \
+    gymnasium \
+    requests \
+    numpy \
+    zstandard \
+    chromadb \
+    vllm || echo "vLLM/Chroma optional local fallbacks enabled if CUDA installation varies"
+
+# Copy core package modules into the sovereign container
+COPY warden/ /workspace/warden/
+COPY data_forge/ /workspace/data_forge/
+COPY physics/ /workspace/physics/
+COPY swarm/ /workspace/swarm/
+COPY escrow/ /workspace/escrow/
+
+# Set up state and data directories
+RUN mkdir -p /workspace/state /workspace/data_store
+
+# Entry point triggers autonomous Think -> Act -> Observe loop
+ENTRYPOINT ["python", "-m", "swarm.child_agent"]
+CMD ["--child-id", "0"]
