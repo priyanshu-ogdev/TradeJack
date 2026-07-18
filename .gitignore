@@ -1,0 +1,60 @@
+# Python Bytecode & Cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+dist/
+build/
+
+# Virtual Environments
+venv/
+env/
+.env
+.venv/
+ENV/
+env.bak/
+venv.bak/
+
+# IDE & Editor Files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# TradeJack State & Runtime Data Store
+# Note: Keep the directory structure but ignore large local state files and simulated databases
+data_store/*
+!data_store/.gitkeep
+state/*
+!state/.gitkeep
+state_test_*/
+data_store_test_*/
+
+# Local Logs & ChromaDB
+logs/
+*.log
+chroma_db/
+*.sqlite
+*.sqlite3
+*.db
+
+# Model Checkpoints & Large Tensors
+*.pt
+*.pth
+*.onnx
+*.safetensors
+*.npz
+*.bin
+*.h5
+*.cifar
+
+# Docker & OS Temporary Files
+.dockerignore
+tmp/
+*.tmp
