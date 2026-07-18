@@ -106,6 +106,18 @@ class LineageVectorDB:
             
         return record_id
 
+    def register_lineage(self, lineage_id: str, metadata: Dict[str, Any], description: str = "Standard Market Regime") -> str:
+        """Alias helper delegating to insert_lineage_record for social relay registration."""
+        return self.insert_lineage_record(
+            child_id=metadata.get("child_id", 0),
+            generation=metadata.get("generation", 1),
+            model_type=metadata.get("model_type", "Dilated-CNN-Seq2seq"),
+            regime_vector=metadata.get("regime_vector", [0.5, 0.5, 0.0, 0.0, 1.0]),
+            sharpe=metadata.get("sharpe_ratio", metadata.get("sharpe", 0.0)),
+            state_dict_path=metadata.get("state_dict_path", ""),
+            regime_description=description
+        )
+
     def query_surviving_weights(
         self,
         current_regime_vector: List[float],

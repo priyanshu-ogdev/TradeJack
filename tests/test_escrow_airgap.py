@@ -70,6 +70,26 @@ class TestEscrowAndAirgap(unittest.TestCase):
         self.assertIn("split_results", report)
         self.assertEqual(len(report["split_results"]["equities"]), 3)
 
+    def test_signed_social_gossip_and_escrow_bridge(self):
+        from swarm.social_relay import SocialRelayBridge, verify_message
+        relay_seller = SocialRelayBridge(child_id=30, state_dir=self.test_state)
+        relay_seller.escrow_bridge = P2PEscrowBridge(state_dir=self.test_state, data_store_dir=self.test_store)
+        
+        # Broadcast signed insight
+        lineage_id = relay_seller.broadcast_market_insight(equity=15.0, sharpe_ratio=2.5, state_dict_path="dummy.pt")
+        
+        # Verify packet stored and valid
+        relay_buyer = SocialRelayBridge(child_id=31, state_dir=self.test_state)
+        relay_buyer.escrow_bridge = relay_seller.escrow_bridge
+        peers = relay_buyer.query_top_peers(min_sharpe=1.0)
+        self.assertGreaterEqual(len(peers), 1)
+        self.assertTrue(verify_message(peers[0]))
+        
+        # Test direct escrow bridge settlement/refund via social relay
+        res = relay_buyer.request_peer_weights_via_escrow(lineage_id, offered_usdc=1.0)
+        self.assertIn("status", res)
+        self.assertIn(res["status"], ["SETTLED", "REFUNDED"])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -70,6 +70,7 @@ class SovereignChild:
         
         self.current_tier = 2
         self.vram_limit_gb = 4.0
+        self.survival_mode = "NORMAL"
         self.is_terminated = False
 
     def petition_and_adapt(self):
@@ -84,6 +85,40 @@ class SovereignChild:
                 target_model_name=self.self_mod.active_model.model_name,
                 current_tier=self.current_tier
             )
+
+    def check_and_enforce_survival_mode(self, portfolio_summary: Dict[str, Any], step: int) -> str:
+        """
+        Monitors live cash/equity and enforces survival mode transitions (`HIGH`, `NORMAL`, `LOW_COMPUTE`, `CRITICAL`).
+        Adapted from Conway-Research/automaton (`low-compute.ts` & `monitor.ts`).
+        """
+        eq = portfolio_summary.get("equity", self.portfolio_engine.equity)
+        cash = portfolio_summary.get("cash", self.portfolio_engine.cash)
+        
+        old_mode = self.survival_mode
+        if eq < 3.0 or cash < 0.0:
+            self.survival_mode = "CRITICAL"
+        elif eq < 5.0 or cash < 5.0:
+            self.survival_mode = "LOW_COMPUTE"
+        elif eq > 20.0 and cash > 20.0:
+            self.survival_mode = "HIGH"
+        else:
+            self.survival_mode = "NORMAL"
+            
+        if old_mode != self.survival_mode:
+            logger.warning(f"Child {self.child_id} transitioned Survival Mode: {old_mode} -> {self.survival_mode} (Eq: ${eq:.2f}, Cash: ${cash:.2f})")
+            if self.survival_mode in ["LOW_COMPUTE", "CRITICAL"]:
+                # Switch to lightweight scalping model to conserve compute VRAM and survival tax
+                if self.self_mod.active_model.model_name != "Deep-Q-learning":
+                    logger.info(f"Survival Mode '{self.survival_mode}' forced downgrade to 'Deep-Q-learning' scalper.")
+                    self.self_mod.swap_active_architecture("Deep-Q-learning", current_tier=3)
+                # Emergency P2P weight petition
+                peers = self.social_relay.query_top_peers(min_sharpe=1.0)
+                if peers:
+                    best_peer = peers[0]
+                    target_lineage = best_peer["lineage_id"]
+                    logger.info(f"Emergency Survival Petition: requesting peer weights '{target_lineage}' via Escrow...")
+                    self.social_relay.request_peer_weights_via_escrow(target_lineage, offered_usdc=0.25)
+        return self.survival_mode
 
     def think(self, obs: Dict[str, np.ndarray]) -> float:
         """
@@ -132,6 +167,9 @@ class SovereignChild:
                 new_equity=env_info["equity"],
                 tick_id=step
             )
+            
+            # Check survival mode transitions
+            self.check_and_enforce_survival_mode(portfolio_summary, step)
             
             # Push transition to HER buffer
             self.her_buffer.push(

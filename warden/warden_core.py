@@ -107,6 +107,17 @@ class WardenHypervisor:
                 remaining_equity REAL
             )
         """)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS tier_transitions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp REAL,
+                tick_id INTEGER,
+                from_tier INTEGER,
+                to_tier INTEGER,
+                equity REAL,
+                reason TEXT
+            )
+        """)
         # Insert genesis entry if empty
         cursor.execute("SELECT COUNT(*) FROM portfolio_state")
         if cursor.fetchone()[0] == 0:
@@ -240,7 +251,11 @@ class WardenHypervisor:
         else:
             tier = 3
             
+        old_tier = getattr(summary, "tier", 2)
         summary.tier = tier
+        
+        if old_tier != tier:
+            self.record_tier_transition(child_id, old_tier, tier, summary, reason=f"Sharpe: {summary.sharpe_ratio:.2f}, DD: {summary.max_drawdown:.2f}")
         
         # Enforce hardware slicing via Docker resource limits or NVIDIA MIG/MPS
         self._enforce_container_hardware_slice(summary.container_name, tier)
@@ -261,6 +276,39 @@ class WardenHypervisor:
             logger.error(f"Failed to record tier allocation: {e}")
             
         return tier
+
+    def record_tier_transition(self, child_id: int, from_tier: int, to_tier: int, summary: ContainerLedgerSummary, reason: str = ""):
+        """
+        Records a formal tier transition into the child SQLite ledger (`tier_transitions`).
+        Adapted from Conway-Research/automaton (`recordTransition`).
+        """
+        db_path = self.get_ledger_path(child_id)
+        if os.path.exists(db_path):
+            try:
+                conn = sqlite3.connect(db_path)
+                cursor = conn.cursor()
+                cursor.execute("""
+                    INSERT INTO tier_transitions (timestamp, tick_id, from_tier, to_tier, equity, reason)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                """, (time.time(), summary.ticks_active, from_tier, to_tier, summary.equity, reason))
+                conn.commit()
+                conn.close()
+            except Exception as e:
+                logger.error(f"Failed to record tier transition in DB for Child {child_id}: {e}")
+        logger.info(f"Child {child_id} transitioned Tier {from_tier} -> Tier {to_tier} ({reason})")
+
+    def check_survival_mode(self, child_id: int, summary: ContainerLedgerSummary) -> str:
+        """
+        Determines survival mode (`HIGH`, `NORMAL`, `LOW_COMPUTE`, `CRITICAL`) based on cash and equity thresholds.
+        Adapted from Conway-Research/automaton (`low-compute.ts` & `monitor.ts`).
+        """
+        if summary.equity < 3.0 or summary.cash < 0.0:
+            return "CRITICAL"
+        elif summary.equity < 5.0 or summary.cash < 5.0:
+            return "LOW_COMPUTE"
+        elif summary.equity > 20.0 and summary.cash > 20.0:
+            return "HIGH"
+        return "NORMAL"
 
     def _enforce_container_hardware_slice(self, container_name: str, tier: int):
         """

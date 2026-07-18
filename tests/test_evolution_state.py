@@ -68,6 +68,40 @@ class TestEvolutionAndRollback(unittest.TestCase):
         bottom = next(item for item in res if item["child_id"] == 2)
         self.assertNotEqual(bottom["learning_rate"], 0.001)
 
+    def test_self_mod_safety_guardrails(self):
+        from swarm.self_mod_manager import validate_self_mod_safety
+        engine = SelfModEngine(child_id=205, state_dir=self.test_state)
+        
+        # Test hard-coded safety invariant block
+        allowed, msg = validate_self_mod_safety("warden/warden_core.py", 500)
+        self.assertFalse(allowed)
+        self.assertIn("BLOCKED: Cannot modify protected file", msg)
+        
+        # Test safe modification allowed
+        safe_file = os.path.join(self.test_state, "custom_strategy.py")
+        mod_res = engine.modify_source_file(safe_file, "# new strategy code", reason="Testing safe modification")
+        self.assertTrue(mod_res["success"])
+        self.assertTrue(os.path.exists(safe_file))
+
+    def test_upgraded_neural_templates(self):
+        from swarm.self_mod_manager import AttentionIsAllYouNeedTemplate, DilatedCNNSeq2SeqTemplate, DeepQLearningTemplate
+        transformer = AttentionIsAllYouNeedTemplate(input_dim=8, d_model=32, nhead=4, num_layers=2)
+        cnn = DilatedCNNSeq2SeqTemplate(input_dim=8, channels=16)
+        dqn = DeepQLearningTemplate(input_dim=8, hidden_dim=16)
+        
+        # Test forward pass with numpy/simulation data
+        sample_seq = np.random.normal(0, 1, (8, 20)).astype(np.float32)
+        out_t = transformer.forward(sample_seq)
+        out_c = cnn.forward(sample_seq)
+        out_q = dqn.forward(sample_seq)
+        
+        self.assertIsNotNone(out_t)
+        self.assertIsNotNone(out_c)
+        self.assertIsNotNone(out_q)
+        
+        # Test Dueling Q-Network novelty mutation
+        dqn.mutate_novelty(mutation_rate=0.1)
+
 
 if __name__ == "__main__":
     unittest.main()
