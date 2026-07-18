@@ -7,6 +7,7 @@ self-modifies architectures under memory pressure, tags HWM checkpoints, and exe
 
 import os
 import sys
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 import time
 import json
 import logging
@@ -74,17 +75,22 @@ class SovereignChild:
         self.is_terminated = False
 
     def petition_and_adapt(self):
-        """Checks with Warden and updates tier assignment."""
+        """Checks with Warden and updates tier assignment + optimal model architecture."""
         petition = self.compute_skill.petition_for_vram(requested_vram_gb=8.0, reason="Routine model forward pass and EWC adaptation")
         if isinstance(petition, dict) and "tier" in petition:
             self.current_tier = int(petition["tier"])
             self.vram_limit_gb = float(petition.get("vram_limit_gb", 4.0))
             logger.info(f"Child {self.child_id} assigned Tier {self.current_tier} ({self.vram_limit_gb}GB VRAM).")
-            # Adapt model architecture if needed
-            self.self_mod.swap_active_architecture(
-                target_model_name=self.self_mod.active_model.model_name,
-                current_tier=self.current_tier
+            # Adapt model architecture dynamically using survival & performance metrics
+            current_sharpe = self.portfolio_engine.compute_risk_adjusted_ratios()[0]
+            target_model = self.self_mod.select_optimal_model_for_survival(
+                current_tier=self.current_tier,
+                current_sharpe=current_sharpe,
+                current_equity=self.portfolio_engine.equity
             )
+            if target_model != self.self_mod.active_model.model_name:
+                logger.info(f"Adapting model architecture: {self.self_mod.active_model.model_name} -> {target_model}")
+                self.self_mod.swap_active_architecture(target_model_name=target_model, current_tier=self.current_tier)
 
     def check_and_enforce_survival_mode(self, portfolio_summary: Dict[str, Any], step: int) -> str:
         """
@@ -107,10 +113,15 @@ class SovereignChild:
         if old_mode != self.survival_mode:
             logger.warning(f"Child {self.child_id} transitioned Survival Mode: {old_mode} -> {self.survival_mode} (Eq: ${eq:.2f}, Cash: ${cash:.2f})")
             if self.survival_mode in ["LOW_COMPUTE", "CRITICAL"]:
-                # Switch to lightweight scalping model to conserve compute VRAM and survival tax
-                if self.self_mod.active_model.model_name != "Deep-Q-learning":
-                    logger.info(f"Survival Mode '{self.survival_mode}' forced downgrade to 'Deep-Q-learning' scalper.")
-                    self.self_mod.swap_active_architecture("Deep-Q-learning", current_tier=3)
+                # Switch to lightweight scalping/curiosity model to conserve compute VRAM and survival tax
+                optimal_model = self.self_mod.select_optimal_model_for_survival(
+                    current_tier=3,
+                    current_sharpe=portfolio_summary.get("sharpe_ratio", 0.0),
+                    current_equity=eq
+                )
+                if self.self_mod.active_model.model_name != optimal_model:
+                    logger.info(f"Survival Mode '{self.survival_mode}' transition adapting model to '{optimal_model}'.")
+                    self.self_mod.swap_active_architecture(optimal_model, current_tier=3)
                 # Emergency P2P weight petition
                 peers = self.social_relay.query_top_peers(min_sharpe=1.0)
                 if peers:

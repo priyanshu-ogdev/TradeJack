@@ -12,6 +12,7 @@ import time
 import math
 import random
 import logging
+import json
 import numpy as np
 from typing import Dict, Any, List, Optional, Tuple
 
@@ -24,6 +25,8 @@ try:
     TORCH_AVAILABLE = True
 except ImportError:
     TORCH_AVAILABLE = False
+
+from swarm.model_registry import REGISTRY
 
 
 class HindsightExperienceReplay:
@@ -106,8 +109,8 @@ class PopulationBasedTrainingEngine:
 
     def execute_pbt_step(self, population_status: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """
-        Takes `population_status` (list of dicts with `child_id`, `equity`, `sharpe_ratio`, `weights_path`, `learning_rate`),
-        sorts by fitness (Sharpe * Equity), and mutates the bottom 20% by copying top 20% weights + noise.
+        Takes `population_status` (list of dicts with `child_id`, `equity`, `sharpe_ratio`, `weights_path`, `learning_rate`, `model_name`, `tier`),
+        sorts by fitness (Sharpe * Equity), and mutates the bottom 20% by copying top 20% weights + noise AND mutating model architecture if stagnant.
         """
         if len(population_status) < 2:
             return population_status
@@ -131,6 +134,27 @@ class PopulationBasedTrainingEngine:
             bottom_child["learning_rate"] = old_lr * mutation_factor
             bottom_child["parent_lineage"] = parent["child_id"]
             
+            # Architecture Mutation: if child is stagnating or negative Sharpe, consider swapping model_name
+            child_sharpe = bottom_child.get("sharpe_ratio", 0.0)
+            child_equity = bottom_child.get("equity", 10.0)
+            child_tier = bottom_child.get("tier", 2)
+            
+            if random.random() < 0.5 or child_sharpe < 0.0 or child_equity < 8.0:
+                parent_model = parent.get("model_name")
+                if parent_model and parent.get("sharpe_ratio", 0.0) > 1.0:
+                    # Check if child tier can support parent model
+                    card = REGISTRY.get_model_card(parent_model)
+                    if card and child_tier <= card.tier_requirement:
+                        bottom_child["model_name"] = parent_model
+                        logger.info(f"[PBT ARCH MUTATION] Child {bottom_child['child_id']} inherited successful model architecture '{parent_model}' from parent {parent['child_id']}.")
+                else:
+                    # Randomly explore another allowed model architecture for this tier
+                    allowed = REGISTRY.list_models_for_tier(max_tier=child_tier)
+                    if allowed:
+                        chosen_card = random.choice(allowed)
+                        bottom_child["model_name"] = chosen_card.model_name
+                        logger.info(f"[PBT ARCH MUTATION] Child {bottom_child['child_id']} explored new model architecture '{chosen_card.model_name}'.")
+
             # Copy parent weights file if exists
             parent_weights = parent.get("weights_path")
             child_weights = bottom_child.get("weights_path")

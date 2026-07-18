@@ -27,6 +27,12 @@ except ImportError:
     logger.info("PyTorch not installed; SelfModEngine using Numpy simulation templates.")
 
 from swarm.ewc_optimizer import ElasticWeightConsolidation
+from swarm.model_registry import REGISTRY, ModelCard, PositionalEncoding, AttentionIsAllYouNeedModel, DilatedCNNSeq2SeqModel, DeepQLearningModel
+
+# Backward-compatibility aliases for existing code and tests
+AttentionIsAllYouNeedTemplate = AttentionIsAllYouNeedModel
+DilatedCNNSeq2SeqTemplate = DilatedCNNSeq2SeqModel
+DeepQLearningTemplate = DeepQLearningModel
 
 # ─── IMMUTABLE SAFETY INVARIANTS (Conway Automaton self-mod/code.ts pattern) ───
 PROTECTED_FILES: frozenset = frozenset([
@@ -57,153 +63,16 @@ def validate_self_mod_safety(file_path: str, content_size: int = 0) -> Tuple[boo
     return True, "All safety checks passed."
 
 
-if TORCH_AVAILABLE:
-    class PositionalEncoding(nn.Module):
-        def __init__(self, d_model: int, max_len: int = 5000):
-            super().__init__()
-            pe = torch.zeros(max_len, d_model)
-            position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
-            div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
-            pe[:, 0::2] = torch.sin(position * div_term)
-            if d_model % 2 == 1:
-                pe[:, 1::2] = torch.cos(position * div_term[:-1])
-            else:
-                pe[:, 1::2] = torch.cos(position * div_term)
-            self.register_buffer('pe', pe.unsqueeze(0))
-
-        def forward(self, x: torch.Tensor) -> torch.Tensor:
-            return x + self.pe[:, :x.size(1), :]
-
-
-class AttentionIsAllYouNeedTemplate:
-    """
-    Positional-Encoded Causal Transformer (`Stock-Prediction-Models/models/transformers/Attention-is-all-you-Need`).
-    Features multi-head self-attention, sinusoidal positional encoding, and causal sequence masking.
-    """
-    def __init__(self, input_dim: int = 8, d_model: int = 128, nhead: int = 8, num_layers: int = 4):
-        self.model_name = "Attention-is-all-you-Need"
-        self.input_dim = input_dim
-        self.d_model = d_model
-        if TORCH_AVAILABLE:
-            self.input_proj = nn.Linear(input_dim, d_model)
-            self.pos_encoder = PositionalEncoding(d_model)
-            encoder_layer = nn.TransformerEncoderLayer(d_model=d_model, nhead=nhead, dim_feedforward=d_model*4, batch_first=True)
-            self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
-            self.output_proj = nn.Linear(d_model, 1)
-            self.net = nn.Sequential(self.input_proj, self.pos_encoder, self.transformer, self.output_proj)
-        else:
-            self.weights = {
-                "encoder": np.random.normal(0, 0.05, (input_dim, d_model)).astype(np.float32),
-                "decoder": np.random.normal(0, 0.05, (d_model, 1)).astype(np.float32)
-            }
-
-    def forward(self, x: Any) -> Any:
-        if TORCH_AVAILABLE and hasattr(self, "input_proj"):
-            if x.dim() == 2:
-                x = x.unsqueeze(0)
-            seq_len = x.size(1)
-            # Generate causal mask to prevent attending to future order book states
-            mask = torch.triu(torch.full((seq_len, seq_len), float('-inf'), device=x.device), diagonal=1)
-            h = self.input_proj(x)
-            h = self.pos_encoder(h)
-            out = self.transformer(h, mask=mask)
-            return self.output_proj(out)
-        return np.sum(x, axis=-1, keepdims=True) * 0.01
-
-
-class DilatedCNNSeq2SeqTemplate:
-    """
-    Stacked Residual Causal Dilated CNN (`Stock-Prediction-Models/models/cnn/Dilated-CNN-Seq2seq`).
-    Features exponential dilation rates [1, 2, 4, 8] with causal left-padding and residual connections.
-    """
-    def __init__(self, input_dim: int = 8, channels: int = 64):
-        self.model_name = "Dilated-CNN-Seq2seq"
-        self.input_dim = input_dim
-        self.channels = channels
-        self.dilations = [1, 2, 4, 8]
-        if TORCH_AVAILABLE:
-            self.input_conv = nn.Conv1d(input_dim, channels, kernel_size=1)
-            self.conv_blocks = nn.ModuleList([
-                nn.Conv1d(channels, channels, kernel_size=3, dilation=d, padding=2*d)
-                for d in self.dilations
-            ])
-            self.fc = nn.Linear(channels, 1)
-            self.net = nn.ModuleList([self.input_conv, self.conv_blocks, self.fc])
-        else:
-            self.weights = {"conv": np.random.normal(0, 0.05, (input_dim, channels)).astype(np.float32)}
-
-    def forward(self, x: Any) -> Any:
-        if TORCH_AVAILABLE and hasattr(self, "conv_blocks"):
-            if x.dim() == 3:
-                x = x.transpose(1, 2)
-            elif x.dim() == 2:
-                x = x.unsqueeze(0).transpose(1, 2)
-            h = self.input_conv(x)
-            for conv, d in zip(self.conv_blocks, self.dilations):
-                residual = h
-                out = torch.relu(conv(h))
-                # Slice causal padding from right
-                out = out[:, :, :-2*d] if 2*d > 0 else out
-                h = torch.relu(out + residual)
-            pooled = torch.mean(h, dim=2)
-            return self.fc(pooled)
-        return np.sum(x, axis=-1, keepdims=True) * 0.008
-
-
-class DeepQLearningTemplate:
-    """
-    Dueling Q-Network & Neuro-Evolution Novelty Scalper (`Stock-Prediction-Models/models/rl/Deep-Q-learning`).
-    Splits Q-value estimation into independent Value V(s) and Advantage A(s, a) streams.
-    """
-    def __init__(self, input_dim: int = 8, hidden_dim: int = 32):
-        self.model_name = "Deep-Q-learning"
-        self.input_dim = input_dim
-        self.hidden_dim = hidden_dim
-        if TORCH_AVAILABLE:
-            self.fc_feat = nn.Sequential(nn.Linear(input_dim, hidden_dim), nn.ReLU())
-            self.fc_val = nn.Linear(hidden_dim, 1)
-            self.fc_adv = nn.Linear(hidden_dim, 3)  # 0: Flat, 1: Long, 2: Short
-            self.net = nn.ModuleList([self.fc_feat, self.fc_val, self.fc_adv])
-        else:
-            self.weights = {
-                "val": np.random.normal(0, 0.05, (input_dim, 1)).astype(np.float32),
-                "adv": np.random.normal(0, 0.05, (input_dim, 3)).astype(np.float32)
-            }
-
-    def forward(self, x: Any) -> Any:
-        if TORCH_AVAILABLE and hasattr(self, "fc_feat"):
-            if x.dim() == 3:
-                x = torch.mean(x, dim=1)
-            elif x.dim() == 1:
-                x = x.unsqueeze(0)
-            feat = self.fc_feat(x)
-            val = self.fc_val(feat)
-            adv = self.fc_adv(feat)
-            q_values = val + adv - torch.mean(adv, dim=1, keepdim=True)
-            return q_values
-        return np.array([0.1, 0.5, -0.2], dtype=np.float32)
-
-    def mutate_novelty(self, mutation_rate: float = 0.05) -> None:
-        """Applies Neuro-Evolution Novelty Search parameter perturbation."""
-        if TORCH_AVAILABLE and hasattr(self, "net"):
-            for param in self.net.parameters():
-                if torch.rand(1).item() < 0.5:
-                    noise = torch.randn_like(param.data) * mutation_rate
-                    param.data.add_(noise)
-        elif hasattr(self, "weights"):
-            for k in self.weights:
-                self.weights[k] += np.random.normal(0, mutation_rate, self.weights[k].shape).astype(np.float32)
-
-
 class SelfModEngine:
     """
-    Manages self-modification and model architecture transitions inside Docker.
+    Manages self-modification and universal model architecture transitions inside Docker.
+    Backed by `TradeJackModelRegistry` containing all 20+ Stock-Prediction-Models architectures.
     """
 
     def __init__(self, child_id: int = 0, state_dir: str = "d:/TradeJack/state"):
         self.child_id = child_id
         self.state_dir = os.path.abspath(state_dir)
-        self.active_model: Any = DilatedCNNSeq2SeqTemplate()
+        self.active_model: Any = REGISTRY.build_model("Dilated-CNN-Seq2seq")
         self.ewc_instance: Optional[ElasticWeightConsolidation] = None
         self.active_tier: int = 2
 
@@ -240,6 +109,19 @@ class SelfModEngine:
         except Exception as e:
             return {"success": False, "error": str(e), "reason": reason}
 
+    def select_optimal_model_for_survival(self, current_tier: int, current_sharpe: float, current_equity: float) -> str:
+        """
+        Dynamically selects the optimal model name from `TradeJackModelRegistry` given live survival mode and memory tier.
+        """
+        if current_tier == 3 or current_equity < 5.00:
+            return "Deep-Q-learning" if current_equity < 3.00 else "Curiosity-Q-learning-Agent"
+        elif current_tier == 1 and current_sharpe > 2.0 and current_equity >= 20.0:
+            return "Attention-is-all-you-Need"
+        elif current_tier == 1 and current_sharpe > 1.5:
+            return "LSTM-Seq2Seq-VAE"
+        else:
+            return "Dilated-CNN-Seq2seq" if current_sharpe >= 0.0 else "Actor-Critic-Duel-Agent"
+
     def swap_active_architecture(
         self,
         target_model_name: str,
@@ -247,33 +129,42 @@ class SelfModEngine:
         calibration_loader: Optional[Any] = None
     ) -> Any:
         """
-        Enforces Warden memory limits and swaps model architecture while computing EWC Fisher bounds
-        to prevent Catastrophic Forgetting.
+        Enforces Warden memory boundaries across all 20+ architectures in TradeJackModelRegistry while computing EWC bounds.
         """
         self.active_tier = current_tier
         logger.info(f"SelfMod Engine triggered model swap to '{target_model_name}' under Tier {current_tier} rules.")
         
-        # Enforce Warden limits
-        if current_tier == 3 and target_model_name != "Deep-Q-learning":
-            logger.warning(f"Tier 3 (Inference-Only) forbids '{target_model_name}'. Forcing 'Deep-Q-learning' scalping model.")
+        card = REGISTRY.get_model_card(target_model_name)
+        if not card:
+            logger.warning(f"Model '{target_model_name}' not found in registry. Using fallback.")
+            card = REGISTRY.get_model_card("Deep-Q-learning")
             target_model_name = "Deep-Q-learning"
-        elif current_tier == 2 and target_model_name == "Attention-is-all-you-Need":
-            logger.warning("Tier 2 (4GB VRAM) forbids heavy 'Attention-is-all-you-Need'. Forcing 'Dilated-CNN-Seq2seq'.")
-            target_model_name = "Dilated-CNN-Seq2seq"
             
+        # Enforce Warden limits: tier_requirement is the minimum memory capability needed (1=20GB, 2=4GB, 3=1GB).
+        # If current_tier > card.tier_requirement, the container has less capability than needed!
+        if current_tier > card.tier_requirement:
+            logger.warning(f"Tier {current_tier} forbids model '{target_model_name}' (requires Tier {card.tier_requirement}). Downgrading to safe tier.")
+            allowed_cards = REGISTRY.list_models_for_tier(max_tier=current_tier)
+            if allowed_cards:
+                # Pick the first/best allowed model for this tier
+                card = allowed_cards[0]
+                target_model_name = card.model_name
+                if current_tier == 3 and target_model_name != "Deep-Q-learning":
+                    card = REGISTRY.get_model_card("Deep-Q-learning")
+                    target_model_name = "Deep-Q-learning"
+                elif current_tier == 2 and target_model_name == "Attention-is-all-you-Need":
+                    card = REGISTRY.get_model_card("Dilated-CNN-Seq2seq")
+                    target_model_name = "Dilated-CNN-Seq2seq"
+            else:
+                card = REGISTRY.get_model_card("Deep-Q-learning")
+                target_model_name = "Deep-Q-learning"
+
         # Compute EWC on outgoing active model before destroying or offloading
         if self.active_model is not None and calibration_loader is not None:
             logger.info("Computing EWC Fisher matrix on outgoing model...")
             self.ewc_instance = ElasticWeightConsolidation(self.active_model, calibration_loader)
             
-        # Instantiate new architecture
-        if target_model_name == "Attention-is-all-you-Need":
-            new_model = AttentionIsAllYouNeedTemplate()
-        elif target_model_name == "Deep-Q-learning":
-            new_model = DeepQLearningTemplate()
-        else:
-            new_model = DilatedCNNSeq2SeqTemplate()
-            
+        new_model = REGISTRY.build_model(target_model_name)
         self.active_model = new_model
         return new_model
 
@@ -283,10 +174,14 @@ if __name__ == "__main__":
     engine = SelfModEngine(child_id=1)
     print("Initial active model:", engine.active_model.model_name)
     
-    # Test tier 2 restriction
+    # Test tier 2 restriction against transformer
     engine.swap_active_architecture("Attention-is-all-you-Need", current_tier=2)
     print("Active model after Tier 2 swap request:", engine.active_model.model_name)
     
     # Test tier 1 allowance
     engine.swap_active_architecture("Attention-is-all-you-Need", current_tier=1)
     print("Active model after Tier 1 swap request:", engine.active_model.model_name)
+    
+    # Test survival model selection
+    opt = engine.select_optimal_model_for_survival(current_tier=3, current_sharpe=-0.5, current_equity=2.50)
+    print("Optimal model for critical survival mode:", opt)
