@@ -36,10 +36,12 @@ python -m unittest discover -s tests -v
 
 ## 2. Local Laptop Development & Simulation Mode
 
-When executed on a development machine without CUDA hardware, the `GenesisPrimeLauncher` detects the environment and activates its CPU/Numpy/Polars binary fallback pipeline:
+When executed on a development machine without CUDA hardware, the `genesis_prime.py` script automatically detects the environment and activates its CPU/Numpy/Polars binary fallback pipeline.
+
+To run the full sandbox Crucible loop locally (where agents are executed via threads instead of Docker containers):
 
 ```bash
-python -m scripts.genesis_prime --containers 10 --steps 50
+$env:PYTHONPATH="d:\TradeJack"; python -m scripts.genesis_prime
 ```
 
 ---
@@ -47,19 +49,19 @@ python -m scripts.genesis_prime --containers 10 --steps 50
 ## 3. Production Deployment on NVIDIA DGX Spark (Grace Blackwell)
 
 ### Step 1: Build Production Docker Image (`Dockerfile.child`)
-The production container is pre-configured with CUDA 13, PyTorch 2.5+, cuDF, KvikIO, and DALI:
-
+The production container is pre-configured with CUDA 13, PyTorch 2.5+, cuDF, KvikIO, and DALI.
 ```bash
 docker build -t tradejack:child-cuda13 -f scripts/Dockerfile.child .
 ```
 
-### Step 2: Launch Master Genesis Prime across 50 MIG Containers
+### Step 2: Launch Master Genesis Prime
 Run the orchestrator on the DGX server:
-
 ```bash
-python -m scripts.genesis_prime --containers 50 --steps 1000000 --dgx-mode
+PYTHONPATH="." python -m scripts.genesis_prime
 ```
 
-- The Warden automatically detects Grace Blackwell hardware (`is_dgx_blackwell = True`).
-- Activates GPUDirect Storage (`cufile`) for high-speed NVME-to-VRAM tensor streaming.
-- Enforces MIG / MVS hardware boundaries across the 50 Docker containers and manages zero-copy NVLink-C2C unified memory swapping.
+**Phase 5 SOTA Protection Protocols at Boot**:
+- **Hardware Validation**: Automatically detects Grace Blackwell (`is_dgx_blackwell = True`) and boots `vLLM` on `CUDA_VISIBLE_DEVICES="0"`.
+- **Environment Masking**: The main python process executing `genesis_prime.py` completely unsets `CUDA_VISIBLE_DEVICES` so it does not fragment the GPU's unified memory. 
+- **Warden Compute Node**: Starts an isolated `multiprocessing.Process` for `WardenComputeServer` that binds to port `8080`, allowing SQLite ledger auditing independent of the Python GIL.
+- **The Reaper Protocol**: `atexit` and `signal` hooks guarantee that no matter how the script crashes or terminates, the Warden and vLLM processes are violently killed, preventing Zombie containers from hoarding VRAM.

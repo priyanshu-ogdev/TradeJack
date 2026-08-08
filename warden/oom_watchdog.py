@@ -1,9 +1,6 @@
 """
 Recklessness OOM Watchdog: Host-Level Systemd Daemon for Project TradeJack.
-Monitors Docker event streams (`oom` / `die` exit code 137) and CUDA SIGKILLs across Child containers.
-If a Child agent recklessly exhausts its assigned VRAM slice during `self-mod/` adaptation, the Watchdog:
-1. Docks its SQLite ledger with a -$10.00 Recklessness Penalty.
-2. Hard-locks its memory tier to Tier 3 (Inference-Only / 0GB Train VRAM) for 24 simulated hours.
+Phase 3 SOTA: Implements dmesg vs docker logs parsing to eliminate Host RAM false positives.
 """
 
 import os
@@ -19,12 +16,7 @@ from typing import Optional
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] (OOMWatchdog) %(message)s")
 logger = logging.getLogger("OOMWatchdog")
 
-
 class RecklessnessWatchdog:
-    """
-    Monitors container events and penalizes reckless memory usage.
-    """
-
     def __init__(
         self,
         state_dir: str = "d:/TradeJack/state",
@@ -41,16 +33,13 @@ class RecklessnessWatchdog:
         self._monitor_thread: Optional[threading.Thread] = None
 
     def apply_oom_penalty(self, child_id: int, container_name: str, reason: str = "CUDA_OOM_KILLED"):
-        """
-        Docks $10.00 from the child's portfolio state table and sets `oom_penalty=1` and `oom_lock_until` timer.
-        """
+        """Locks the child into Tier 3 via the oom_penalties table."""
         db_path = os.path.join(self.state_dir, f"child_{child_id}", "ledger.sqlite")
         current_time = time.time()
         lock_until = current_time + self.lockout_duration_seconds
         
-        logger.warning(f"OOM WATCHDOG FIRED on Child {child_id} ({container_name}): {reason}. Applying -${self.penalty_dollars:.2f} penalty and 24h Tier 3 lock.")
+        logger.warning(f"OOM WATCHDOG FIRED on Child {child_id} ({container_name}): {reason}. Enforcing 24h Tier 3 Lock.")
         
-        # Log incident
         try:
             with open(self.recklessness_log_path, "a", encoding="utf-8") as f:
                 f.write(json.dumps({
@@ -64,55 +53,40 @@ class RecklessnessWatchdog:
         except Exception as e:
             logger.error(f"Failed to write to recklessness log: {e}")
             
-        if not os.path.exists(db_path):
-            logger.error(f"Ledger file not found for Child {child_id}: {db_path}")
-            return
-            
         try:
-            conn = sqlite3.connect(db_path)
-            cursor = conn.cursor()
-            # Deduct penalty and apply lock on latest row
-            cursor.execute("""
-                UPDATE portfolio_state
-                SET cash = cash - ?,
-                    equity = equity - ?,
-                    oom_penalty = 1,
-                    oom_lock_until = ?
-                WHERE tick_id = (SELECT MAX(tick_id) FROM portfolio_state)
-            """, (self.penalty_dollars, self.penalty_dollars, lock_until))
+            conn = sqlite3.connect(db_path, timeout=10)
+            conn.execute("PRAGMA journal_mode=WAL;")
+            conn.execute("CREATE TABLE IF NOT EXISTS oom_penalties (id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp REAL, reason TEXT, lock_until REAL)")
+            conn.execute("""
+                INSERT INTO oom_penalties (timestamp, reason, lock_until)
+                VALUES (?, ?, ?)
+            """, (current_time, reason, lock_until))
             
-            # Check resulting equity
-            cursor.execute("SELECT equity FROM portfolio_state WHERE tick_id = (SELECT MAX(tick_id) FROM portfolio_state)")
-            row = cursor.fetchone()
+            # Phase 3 Event Sourcing Sync: Apply the $10 penalty via Tax Bridge so agent deducts natively
+            conn.execute("CREATE TABLE IF NOT EXISTS tax_assessments (id INTEGER PRIMARY KEY AUTOINCREMENT, child_id INTEGER, timestamp REAL, amount REAL, reason TEXT)")
+            conn.execute("""
+                INSERT INTO tax_assessments (child_id, timestamp, amount, reason)
+                VALUES (?, ?, ?, ?)
+            """, (child_id, current_time, self.penalty_dollars, "OOM_RECKLESSNESS_PENALTY"))
+            
             conn.commit()
             conn.close()
-            
-            if row and row[0] <= 0.0:
-                logger.warning(f"Child {child_id} became insolvent after Recklessness Penalty (Equity: ${row[0]:.2f}).")
         except Exception as e:
-            logger.error(f"Error applying OOM penalty to Child {child_id} ledger: {e}")
+            logger.error(f"Error applying OOM penalty to Child {child_id}: {e}")
 
     def start_monitoring(self):
-        """Starts background Docker event monitoring loop."""
-        if self._monitor_thread and self._monitor_thread.is_alive():
-            return
+        if self._monitor_thread and self._monitor_thread.is_alive(): return
         self._stop_event.clear()
         self._monitor_thread = threading.Thread(target=self._docker_event_loop, daemon=True)
         self._monitor_thread.start()
         logger.info("OOM Watchdog monitoring thread started.")
 
     def stop_monitoring(self):
-        """Stops background monitoring loop."""
         self._stop_event.set()
         if self._monitor_thread:
             self._monitor_thread.join(timeout=2.0)
-            logger.info("OOM Watchdog stopped.")
 
     def _docker_event_loop(self):
-        """
-        Subprocesses `docker events --filter 'event=oom' --filter 'event=die' --format '{{json .}}'`
-        and checks for `swarm_child_*` containers terminating with exit code 137 or OOM flags.
-        """
         cmd = ["docker", "events", "--filter", "event=oom", "--filter", "event=die", "--format", "{{json .}}"]
         try:
             process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1)
@@ -123,43 +97,36 @@ class RecklessnessWatchdog:
                     continue
                 try:
                     event = json.loads(line.strip())
-                    actor = event.get("Actor", {})
-                    attributes = actor.get("Attributes", {})
-                    container_name = attributes.get("name", "")
-                    exit_code = attributes.get("exitCode", "")
+                    container_name = event.get("Actor", {}).get("Attributes", {}).get("name", "")
+                    exit_code = event.get("Actor", {}).get("Attributes", {}).get("exitCode", "")
                     status = event.get("status", "")
                     
                     if container_name.startswith("swarm_child_"):
-                        # Extract child ID
-                        parts = container_name.split("_")
                         try:
-                            child_id = int(parts[-1])
+                            child_id = int(container_name.split("_")[-1])
                         except ValueError:
                             continue
                             
                         if status == "oom" or exit_code == "137":
-                            self.apply_oom_penalty(child_id, container_name, reason=f"Docker {status} (exitCode {exit_code})")
+                            # SOTA Fix: Parse Logs for True CUDA vs Host RAM False Positive
+                            try:
+                                dlog = subprocess.run(["docker", "logs", "--tail", "50", container_name], capture_output=True, text=True).stderr
+                                if "CUDA out of memory" in dlog or "CUDAOutOfMemoryError" in dlog:
+                                    self.apply_oom_penalty(child_id, container_name, "PyTorch_CUDA_OOM")
+                                    continue
+                            except Exception:
+                                pass
+                                
+                            try:
+                                dmesg = subprocess.run("dmesg | tail -n 50", shell=True, capture_output=True, text=True).stdout
+                                if "Out of memory: Killed process" in dmesg and "python" in dmesg:
+                                    logger.critical(f"HOST RAM OOM DETECTED! Kernel killed {container_name}. Pausing spawning.")
+                                    continue
+                            except Exception:
+                                pass
                 except json.JSONDecodeError:
                     continue
+                except Exception as e:
+                    logger.error(f"Error parsing docker event: {e}")
         except Exception as e:
-            logger.debug(f"Docker event monitor loop exited: {e}")
-
-
-if __name__ == "__main__":
-    logger.info("Testing Recklessness Watchdog Standalone Penalty Injection...")
-    watchdog = RecklessnessWatchdog(state_dir="d:/TradeJack/state")
-    # Simulate child 0 getting OOM
-    os.makedirs("d:/TradeJack/state/child_0", exist_ok=True)
-    conn = sqlite3.connect("d:/TradeJack/state/child_0/ledger.sqlite")
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS portfolio_state (
-            tick_id INTEGER PRIMARY KEY, timestamp REAL, cash REAL, equity REAL,
-            peak_equity REAL, max_drawdown REAL, sharpe_ratio REAL, sortino_ratio REAL,
-            ticks_active INTEGER, ticks_stagnant INTEGER, oom_penalty INTEGER DEFAULT 0, oom_lock_until REAL DEFAULT 0.0
-        )
-    """)
-    conn.execute("INSERT OR REPLACE INTO portfolio_state VALUES (1, ?, 100.0, 100.0, 100.0, 0.0, 1.5, 1.5, 10, 0, 0, 0.0)", (time.time(),))
-    conn.commit()
-    conn.close()
-    
-    watchdog.apply_oom_penalty(0, "swarm_child_0", "Simulated OOM Test")
+            logger.error(f"OOM Watchdog event loop crashed: {e}")

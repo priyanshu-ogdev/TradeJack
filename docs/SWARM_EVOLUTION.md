@@ -15,7 +15,7 @@ Each container executes `SovereignChild.run_crucible_loop()`, an autonomous, con
 
 ---
 
-## 2. Dynamic Architecture Swapping (`self_mod_manager.py`)
+## 2. Dynamic Architecture Swapping & Aggressive CUDA Purging (`self_mod_manager.py`)
 
 To guarantee strict compliance with the Warden's VRAM tier assignments, `SelfModEngine` manages three distinct neural architectures inside each container:
 
@@ -29,7 +29,11 @@ To guarantee strict compliance with the Warden's VRAM tier assignments, `SelfMod
    - **VRAM Requirement**: `Tier 3 (0.0 GB / Inference-Only)`
    - **Structure**: Compact multi-layer perceptron (`Linear` -> `ReLU`) optimized for rapid scalping decisions when VRAM is locked or when a container is recovering from an OOM penalty.
 
-If a container's tier changes (`swap_active_architecture`), the engine dynamically instantiates the new topology, pins it to host RAM, and loads surviving parameter embeddings where dimensions match.
+### Phase 5 Upgrades: The Ghost Brain & Memory Creep Fixes
+In Phase 5, the `SelfModEngine` received critical hardening to survive 100-day hot-swapping without leaking VRAM:
+- **Aggressive CUDA Purge**: Before swapping architectures, the engine pushes the old model's weights to CPU (`old_model.cpu()`), deletes the instance, executes `gc.collect()`, deletes the module from Python's C++ cache (`del sys.modules["active_model"]`), and sweeps the physical GPU registers with `torch.cuda.empty_cache()`.
+- **Dynamic AST Module Re-loading**: When the agent requests a code-rewrite from the Automaton reasoning bridge, the new python file is loaded dynamically via `importlib.util.spec_from_file_location`, bypassing the Ghost Brain bug where Python refused to clear the old AST structure.
+- **Sandboxed Dry-Runs**: Rewritten code is executed in an isolated `subprocess.run` with a strict `timeout=15.0`. If the LLM generated an infinite `while` loop or malformed tensor shapes, the subprocess crashes safely, and the agent rolls back without corrupting the live trading loop.
 
 ---
 

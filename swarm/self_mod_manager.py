@@ -13,6 +13,14 @@ import logging
 import inspect
 import math
 import numpy as np
+import ast
+import subprocess
+import shutil
+import importlib.util
+import gc
+import subprocess
+import shutil
+import importlib.util
 from typing import Dict, Any, List, Optional, Tuple
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] (SelfModEngine) %(message)s")
@@ -126,7 +134,8 @@ class SelfModEngine:
         self,
         target_model_name: str,
         current_tier: int,
-        calibration_loader: Optional[Any] = None
+        calibration_loader: Optional[Any] = None,
+        input_dim: int = 5
     ) -> Any:
         """
         Enforces Warden memory boundaries across all 20+ architectures in TradeJackModelRegistry while computing EWC bounds.
@@ -164,9 +173,120 @@ class SelfModEngine:
             logger.info("Computing EWC Fisher matrix on outgoing model...")
             self.ewc_instance = ElasticWeightConsolidation(self.active_model, calibration_loader)
             
-        new_model = REGISTRY.build_model(target_model_name)
+        # SOTA Fix Bug 2: Aggressive CUDA Purge to prevent Memory Creep
+        if self.active_model is not None:
+            if hasattr(self.active_model, 'cpu'):
+                self.active_model.cpu()
+            del self.active_model
+            gc.collect()
+            if TORCH_AVAILABLE and torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            if "active_model" in sys.modules:
+                del sys.modules["active_model"]
+                
+        new_model = REGISTRY.build_model(target_model_name, input_dim=input_dim)
         self.active_model = new_model
         return new_model
+
+    def invoke_vllm_reasoning_bridge(self, current_tier: int, stagnation_duration: float, current_sharpe: float, input_dim: int = 5):
+        """
+        Mock vLLM reasoning bridge to simulate calling the Repo 2 Automaton Node.js sidecar.
+        Informs the Automaton of the stagnation, and requests a rewritten PyTorch architecture
+        bound by the current Warden tier allocations.
+        Implements SOTA AST Sandboxing, Subprocess Timeout, and ImportLib hot-swapping.
+        """
+        logger.warning(f"=== Automaton vLLM Reasoning Bridge Invoked ===")
+        logger.warning(f"  VRAM Tier: {current_tier} (Constraint)")
+        logger.warning(f"  Stagnation: {stagnation_duration/3600:.2f} hours")
+        logger.warning(f"  Current Sharpe: {current_sharpe:.2f}")
+        logger.warning(f"  Prompting local LLM endpoint to rewrite {self.active_model.model_name}...")
+        
+        time.sleep(1.0)
+        logger.info(f"Automaton responded. Injecting Blackwell FP8 optimizations...")
+        
+        mock_new_code = f'''
+import torch
+import torch.nn as nn
+import numpy as np
+
+class AutonomousModel(nn.Module):
+    def __init__(self, input_dim={input_dim}, hidden_dim=64):
+        super().__init__()
+        self.model_name = "VLLM-Autonomous-Model"
+        self.fc1 = nn.Linear(input_dim, hidden_dim)
+        self.fc2 = nn.Linear(hidden_dim, 1)
+        
+    def forward(self, x):
+        if x.dim() == 3: x = torch.mean(x, dim=1)
+        elif x.dim() == 1: x = x.unsqueeze(0)
+        return self.fc2(torch.relu(self.fc1(x)))
+'''
+        mock_new_code = self.inject_blackwell_fp8_optimizations(mock_new_code)
+        
+        # 1. Save to Staging (Fix PyTorch File-Lock Contention)
+        child_dir = os.path.join(self.state_dir, f"child_{self.child_id}")
+        os.makedirs(child_dir, exist_ok=True)
+        staging_path = os.path.join(child_dir, "staging_model.py")
+        active_path = os.path.join(child_dir, "active_model.py")
+        
+        with open(staging_path, "w", encoding="utf-8") as f:
+            f.write(mock_new_code)
+            
+        # 2. AST Parse (Fix Hallucinated Syntax Crash)
+        try:
+            ast.parse(mock_new_code)
+        except SyntaxError as e:
+            logger.error(f"Hallucinated Syntax Error in LLM Code: {e}")
+            return
+            
+        # 3. Sandboxed Dry-Run (Fix Runaway Shell Infinite Loop)
+        dry_run_script = f'''
+import torch
+import sys
+import os
+sys.path.insert(0, r'{child_dir}')
+import staging_model
+model = staging_model.AutonomousModel(input_dim={input_dim})
+x = torch.randn(1, 64, {input_dim})
+out = model.forward(x)
+if out.shape[0] != 1:
+    sys.exit(1)
+'''
+        dry_path = os.path.join(child_dir, "dry_run.py")
+        with open(dry_path, "w", encoding="utf-8") as f:
+            f.write(dry_run_script)
+            
+        try:
+            logger.info("Initiating Sandboxed Dry-Run...")
+            subprocess.run([sys.executable, dry_path], timeout=15.0, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except subprocess.TimeoutExpired:
+            logger.error("Runaway Shell Infinite Loop detected! Terminating subprocess.")
+            return
+        except subprocess.CalledProcessError:
+            logger.error("Dry-Run crashed (Shape mismatch or Runtime Error)!")
+            return
+            
+        # 4. Atomic File-Swap (No file locks during live forward passes)
+        shutil.move(staging_path, active_path)
+        
+        # 5. Dynamic Module Loading (Ghost Brain Fix)
+        # SOTA Fix Bug 2: Aggressive CUDA Purge to prevent Memory Creep
+        if self.active_model is not None:
+            if hasattr(self.active_model, 'cpu'):
+                self.active_model.cpu()
+            del self.active_model
+            gc.collect()
+            if TORCH_AVAILABLE and torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            if "active_model" in sys.modules:
+                del sys.modules["active_model"]
+
+        spec = importlib.util.spec_from_file_location("active_model", active_path)
+        if spec and spec.loader:
+            active_module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(active_module)
+            self.active_model = active_module.AutonomousModel(input_dim=input_dim)
+            logger.info(f"Ghost Brain bypassed. Active model swapped to {self.active_model.model_name} dynamically.")
 
 
 if __name__ == "__main__":
@@ -185,3 +305,7 @@ if __name__ == "__main__":
     # Test survival model selection
     opt = engine.select_optimal_model_for_survival(current_tier=3, current_sharpe=-0.5, current_equity=2.50)
     print("Optimal model for critical survival mode:", opt)
+    
+    # Test VLLM Reasoning Bridge
+    engine.invoke_vllm_reasoning_bridge(current_tier=1, stagnation_duration=15000.0, current_sharpe=-1.0, input_dim=5)
+    print("Active model after vLLM rewrite:", engine.active_model.model_name)

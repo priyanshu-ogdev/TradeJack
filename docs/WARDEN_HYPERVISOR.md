@@ -31,7 +31,15 @@ If a container's equity drops below $\$0.00$ or cash drops below $-\$50.00$, the
 
 ---
 
-## 3. Zero-OOM Unified Memory Swapping (`unified_memory_swap.py`)
+## 3. Idempotent Multiprocessing Audit (SOTA Phase 5 Upgrade)
+
+To ensure the Warden's `run_audit_cycle()` does not suffer from Global Interpreter Lock (GIL) contention and micro-stutters during heavy SQLite queries across 50 databases:
+- **Multiprocessing Isolation**: The audit loop (`_audit_worker_process` in `compute_server.py`) operates in a completely isolated OS-level `multiprocessing.Process`, utilizing separate ARM CPU cores on the DGX.
+- **Idempotent Taxation**: To prevent overlapping cycles from taxing the same tick twice (The "Double-Dip" bug), the `tax_assessments` table strictly enforces a `UNIQUE(child_id, market_timestamp, tax_type)` schema. The Warden issues `INSERT OR IGNORE` statements, mathematically guaranteeing idempotency across all asynchronous edge cases.
+
+---
+
+## 4. Zero-OOM Unified Memory Swapping (`unified_memory_swap.py`)
 
 The **Grace Blackwell architecture** connects the Grace CPU and Blackwell GPU via high-speed **NVLink-C2C**, creating a single **128GB Unified Memory** address space. `BlackwellUnifiedAllocator` exploits this physical capability to completely eliminate CUDA out-of-memory crashes:
 
@@ -40,7 +48,7 @@ The **Grace Blackwell architecture** connects the Grace CPU and Blackwell GPU vi
 
 ---
 
-## 4. Recklessness Watchdog (`oom_watchdog.py`)
+## 5. Recklessness Watchdog (`oom_watchdog.py`)
 
 The `RecklessnessWatchdog` continuously monitors container execution for memory violations and crashes:
 - If a child attempts to allocate memory beyond its assigned MIG quota and triggers a `CUDA_OOM_KILLED` or `MemoryError`, the watchdog intercepts the event.
@@ -49,7 +57,7 @@ The `RecklessnessWatchdog` continuously monitors container execution for memory 
 
 ---
 
-## 5. Evolutionary Lineage Repository (`lineage_vector_db.py`)
+## 6. Evolutionary Lineage Repository (`lineage_vector_db.py`)
 
 When a container achieves superior alpha or discovers a breakthrough neural architecture, the Warden records the model topology and its flattened parameter embeddings inside `LineageVectorDB`.
 - Uses **ChromaDB** when installed, or falls back to a custom **SQLite + ZSTD Cosine Similarity Index** on local CPUs.

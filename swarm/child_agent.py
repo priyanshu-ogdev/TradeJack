@@ -52,22 +52,21 @@ class SovereignChild:
         self.state_dir = os.path.abspath(state_dir)
         self.data_store_dir = os.path.abspath(data_store_dir)
         
-        # Initialize Subsystems
-        self.compute_skill = DGXComputeSkill(child_id=self.child_id)
-        self.self_mod = SelfModEngine(child_id=self.child_id, state_dir=self.state_dir)
-        self.rollback_engine = GitFinancialRollback(child_id=self.child_id, repo_dir="d:/TradeJack")
-        self.portfolio_engine = PortfolioAccountingEngine(child_id=self.child_id, state_dir=self.state_dir, initial_cash=self.initial_cash)
-        self.social_relay = SocialRelayBridge(child_id=self.child_id, state_dir=self.state_dir)
-        self.her_buffer = HindsightExperienceReplay(capacity=10000)
-        self.spoofer = AdversarialGANSpoofer(spoof_intensity=0.2)
-        
-        # Physical Environment
+        # Physical Environment (Initializes its own PortfolioAccountingEngine internally)
         self.env = TradeJackLOBEnv(
             symbol=self.symbol,
             initial_cash=self.initial_cash,
             data_store_dir=self.data_store_dir,
             child_id=self.child_id
         )
+
+        # Initialize Subsystems
+        self.compute_skill = DGXComputeSkill(child_id=self.child_id)
+        self.self_mod = SelfModEngine(child_id=self.child_id, state_dir=self.state_dir)
+        self.rollback_engine = GitFinancialRollback(child_id=self.child_id, repo_dir="d:/TradeJack")
+        self.social_relay = SocialRelayBridge(child_id=self.child_id, state_dir=self.state_dir)
+        self.her_buffer = HindsightExperienceReplay(capacity=10000)
+        self.spoofer = AdversarialGANSpoofer(spoof_intensity=0.2)
         
         self.current_tier = 2
         self.vram_limit_gb = 4.0
@@ -82,23 +81,24 @@ class SovereignChild:
             self.vram_limit_gb = float(petition.get("vram_limit_gb", 4.0))
             logger.info(f"Child {self.child_id} assigned Tier {self.current_tier} ({self.vram_limit_gb}GB VRAM).")
             # Adapt model architecture dynamically using survival & performance metrics
-            current_sharpe = self.portfolio_engine.compute_risk_adjusted_ratios()[0]
+            current_sharpe = self.env.accounting._compute_ratios()[0]
             target_model = self.self_mod.select_optimal_model_for_survival(
                 current_tier=self.current_tier,
                 current_sharpe=current_sharpe,
-                current_equity=self.portfolio_engine.equity
+                current_equity=self.env.accounting.equity
             )
+            input_dim = self.env.observation_space["lob_sequence"].shape[-1] if hasattr(self.env, "observation_space") else 5
             if target_model != self.self_mod.active_model.model_name:
                 logger.info(f"Adapting model architecture: {self.self_mod.active_model.model_name} -> {target_model}")
-                self.self_mod.swap_active_architecture(target_model_name=target_model, current_tier=self.current_tier)
+                self.self_mod.swap_active_architecture(target_model_name=target_model, current_tier=self.current_tier, input_dim=input_dim)
 
     def check_and_enforce_survival_mode(self, portfolio_summary: Dict[str, Any], step: int) -> str:
         """
         Monitors live cash/equity and enforces survival mode transitions (`HIGH`, `NORMAL`, `LOW_COMPUTE`, `CRITICAL`).
         Adapted from Conway-Research/automaton (`low-compute.ts` & `monitor.ts`).
         """
-        eq = portfolio_summary.get("equity", self.portfolio_engine.equity)
-        cash = portfolio_summary.get("cash", self.portfolio_engine.cash)
+        eq = portfolio_summary.get("equity", self.env.accounting.equity)
+        cash = portfolio_summary.get("cash", self.env.accounting.cash)
         
         old_mode = self.survival_mode
         if eq < 3.0 or cash < 0.0:
@@ -116,14 +116,16 @@ class SovereignChild:
                 # Switch to lightweight scalping/curiosity model to conserve compute VRAM and survival tax
                 optimal_model = self.self_mod.select_optimal_model_for_survival(
                     current_tier=3,
-                    current_sharpe=portfolio_summary.get("sharpe_ratio", 0.0),
+                    current_sharpe=self.env.accounting._compute_ratios()[0],
                     current_equity=eq
                 )
+                input_dim = self.env.observation_space["lob_sequence"].shape[-1] if hasattr(self.env, "observation_space") else 5
                 if self.self_mod.active_model.model_name != optimal_model:
                     logger.info(f"Survival Mode '{self.survival_mode}' transition adapting model to '{optimal_model}'.")
-                    self.self_mod.swap_active_architecture(optimal_model, current_tier=3)
+                    self.self_mod.swap_active_architecture(optimal_model, current_tier=3, input_dim=input_dim)
                 # Emergency P2P weight petition
-                peers = self.social_relay.query_top_peers(min_sharpe=1.0)
+                regime_vector = self.env.obs_mean.tolist() if hasattr(self.env, "obs_mean") else None
+                peers = self.social_relay.query_top_peers(min_sharpe=1.0, current_regime_vector=regime_vector)
                 if peers:
                     best_peer = peers[0]
                     target_lineage = best_peer["lineage_id"]
@@ -144,13 +146,30 @@ class SovereignChild:
             with torch.no_grad():
                 out = self.self_mod.active_model.forward(t_in)
                 if isinstance(out, torch.Tensor):
-                    action_val = float(out.mean().cpu().numpy())
+                    if out.shape[-1] == 3:
+                        action_idx = int(torch.argmax(out, dim=-1).item())
+                        mapping = {0: 0.0, 1: 1.0, 2: -1.0}
+                        action_val = mapping.get(action_idx, 0.0)
+                    else:
+                        action_val = float(out.mean().item())
                 else:
-                    action_val = float(np.mean(out))
+                    out_arr = np.array(out)
+                    if out_arr.shape[-1] == 3:
+                        action_idx = int(np.argmax(out_arr, axis=-1))
+                        mapping = {0: 0.0, 1: 1.0, 2: -1.0}
+                        action_val = mapping.get(action_idx, 0.0)
+                    else:
+                        action_val = float(np.mean(out_arr))
         else:
             # Numpy / simulation model evaluation
             out = self.self_mod.active_model.forward(spoofed_lob)
-            action_val = float(np.mean(out))
+            out_arr = np.array(out)
+            if out_arr.shape[-1] == 3:
+                action_idx = int(np.argmax(out_arr, axis=-1))
+                mapping = {0: 0.0, 1: 1.0, 2: -1.0}
+                action_val = mapping.get(action_idx, 0.0)
+            else:
+                action_val = float(np.mean(out_arr))
             
         # Scale and clip action to [-1.0, 1.0]
         return float(np.clip(action_val, -1.0, 1.0))
@@ -172,12 +191,21 @@ class SovereignChild:
             # 2. Act
             next_obs, reward, terminated, truncated, env_info = self.env.step([action])
             
-            # 3. Record in SQLite Ledger
-            portfolio_summary = self.portfolio_engine.record_step(
-                new_cash=env_info["cash"],
-                new_equity=env_info["equity"],
-                tick_id=step
-            )
+            # Extract market_timestamp safely, LOBEnv might not expose it in env_info directly
+            # but we can get it manually since we control the env.
+            obs_idx = max(0, self.env.current_step_in_batch - 1)
+            current_market_ts = self.env._get_scalar("timestamp", obs_idx)
+            
+            # 3. Retrieve Summary from Internal Accounting
+            # lob_env.py already called record_step() and updated the SQLite Ledger natively.
+            portfolio_summary = {
+                "equity": self.env.accounting.equity,
+                "cash": self.env.accounting.cash,
+                "max_drawdown": self.env.accounting.max_drawdown,
+                "lifetime_sharpe": self.env.accounting._compute_ratios()[0],
+                "rolling_sortino": self.env.accounting._compute_ratios()[1],
+                "last_hwm": self.env.accounting.last_hwm_market_timestamp
+            }
             
             # Check survival mode transitions
             self.check_and_enforce_survival_mode(portfolio_summary, step)
@@ -199,14 +227,16 @@ class SovereignChild:
             
             # Check HWM tagging
             tag = self.rollback_engine.check_and_checkpoint(current_equity=current_eq)
-            if tag and portfolio_summary["sharpe_ratio"] > 1.5:
+            if tag and portfolio_summary["lifetime_sharpe"] > 1.5:
                 # Broadcast high-Sharpe weights to social relay
                 weights_path = os.path.join(self.state_dir, f"child_{self.child_id}", f"weights_{tag}.pt")
+                regime_vector = self.env.obs_mean.tolist() if hasattr(self.env, "obs_mean") else None
                 self.social_relay.broadcast_market_insight(
                     equity=current_eq,
-                    sharpe_ratio=portfolio_summary["sharpe_ratio"],
+                    sharpe_ratio=portfolio_summary["lifetime_sharpe"],
                     state_dict_path=weights_path,
-                    description=f"HWM {tag} on {self.symbol} (Model: {self.self_mod.active_model.model_name})"
+                    description=f"HWM {tag} on {self.symbol} (Model: {self.self_mod.active_model.model_name})",
+                    regime_vector=regime_vector
                 )
                 
             # Check Drawdown Breach Rollback (>15%)
@@ -216,32 +246,43 @@ class SovereignChild:
             )
             if did_rollback:
                 logger.warning(f"Child {self.child_id} reverted after drawdown breach at step {step}.")
-                # Reset environment equity tracking to restored state if live
                 
-            # Check Stagnation ("Turtling") -> Request P2P weights or tier swap
-            if portfolio_summary["ticks_stagnant"] >= 30 and step % 30 == 0:
-                logger.info(f"Child {self.child_id} stagnant for 30 ticks. Querying Social Relay for peer breakthrough...")
-                peers = self.social_relay.query_top_peers(min_sharpe=1.2)
+            # Check Stagnation (Time-Dilation) -> Request P2P weights or trigger self-mod
+            stagnation_seconds = current_market_ts - portfolio_summary["last_hwm"]
+            if stagnation_seconds >= 14400.0 and step % 100 == 0:  # 4 hours
+                logger.info(f"Child {self.child_id} computationally stagnant for {stagnation_seconds/3600:.1f} hours. Querying Social Relay for peer breakthrough...")
+                regime_vector = self.env.obs_mean.tolist() if hasattr(self.env, "obs_mean") else None
+                peers = self.social_relay.query_top_peers(min_sharpe=1.2, current_regime_vector=regime_vector)
                 if peers:
                     best_peer = peers[0]
                     target_lineage = best_peer["lineage_id"]
                     self.social_relay.request_peer_weights_via_escrow(target_lineage, offered_usdc=0.50)
+                else:
+                    # Invoke Automaton VLLM mock to reason out a new architecture
+                    logger.warning("No peers available. Triggering Automaton vLLM self-modification...")
+                    input_dim = self.env.observation_space["lob_sequence"].shape[-1] if hasattr(self.env, "observation_space") else 5
+                    self.self_mod.invoke_vllm_reasoning_bridge(
+                        current_tier=self.current_tier,
+                        stagnation_duration=stagnation_seconds,
+                        current_sharpe=portfolio_summary["lifetime_sharpe"],
+                        input_dim=input_dim
+                    )
                     
             obs = next_obs
             
             if terminated or truncated:
-                logger.info(f"Child {self.child_id} loop concluded at step {step}. Equity: ${current_eq:.2f}, Sharpe: {portfolio_summary['sharpe_ratio']:.2f}.")
+                logger.info(f"Child {self.child_id} loop concluded at step {step}. Equity: ${current_eq:.2f}, Sharpe: {portfolio_summary['lifetime_sharpe']:.2f}.")
                 break
                 
         self.is_terminated = True
         return {
             "child_id": self.child_id,
             "steps_completed": step + 1,
-            "final_equity": self.portfolio_engine.equity,
-            "peak_equity": self.portfolio_engine.peak_equity,
-            "max_drawdown": self.portfolio_engine.max_drawdown,
-            "sharpe_ratio": self.portfolio_engine.compute_risk_adjusted_ratios()[0],
-            "sortino_ratio": self.portfolio_engine.compute_risk_adjusted_ratios()[1],
+            "final_equity": self.env.accounting.equity,
+            "peak_equity": self.env.accounting.peak_equity,
+            "max_drawdown": self.env.accounting.max_drawdown,
+            "sharpe_ratio": self.env.accounting._compute_ratios()[0],
+            "sortino_ratio": self.env.accounting._compute_ratios()[1],
             "active_tier": self.current_tier,
             "active_model": self.self_mod.active_model.model_name
         }

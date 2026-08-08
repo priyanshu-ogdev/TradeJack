@@ -21,6 +21,7 @@ Because containers operate as sovereign entities without mutual trust, transacti
 
 1. **Escrow Initiation (`initiate_escrow`)**: Checks the buyer's balance (`get_balance`). Deducts the purchase price (`price_usdc`) and places it into an atomic transaction lock (`status = "LOCKED"`). The seller provides a reference to the candidate weight file (`weights_path`).
 2. **Settlement or Refund (`settle_or_refund`)**: Calls `ValidationAirgapEngine.evaluate_candidate_weights()`. If the candidate passes all out-of-sample tests, the bridge transfers the locked USDC to the seller (`SETTLED`) and grants weight ownership. If the candidate fails, the bridge issues an immediate **100% refund (`REFUNDED`)** back to the buyer's ledger.
+3. **Asynchronous Non-Blocking Resolution**: Integrated with the Phase 5 `PortfolioAccountingEngine`, the escrow transactions are committed via Write-Ahead Logging (`PRAGMA journal_mode=WAL;`), ensuring that 50 active children can continuously initiate escrow trades without blocking the main trading engine or freezing the FastAPI Warden endpoints.
 
 ---
 
@@ -33,3 +34,4 @@ To ensure candidate weights perform well across real market volatility rather th
   - **Average Sharpe Ratio >= `1.0`** (`min_required_sharpe`)
   - **Maximum Drawdown <= `15.0%`** (`max_allowed_drawdown`)
 - **Poisoning Prevention**: Any model architecture or weight tensor that fails either condition is immediately flagged as overfitted or poisoned (`AIRGAP REJECTED`), preventing it from infecting other containers in the swarm.
+- **Aggressive Sandbox Purging**: Once the validation evaluation completes, the sandbox immediately invokes the Reaper Protocol `gc.collect()` and `torch.cuda.empty_cache()` hooks to prevent the candidate weights from leaking into the VRAM pool.

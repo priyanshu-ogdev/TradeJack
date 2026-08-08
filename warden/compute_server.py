@@ -9,6 +9,8 @@ import sys
 import time
 import json
 import logging
+import threading
+import multiprocessing
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
 from typing import Dict, Any, Optional
@@ -17,6 +19,16 @@ from typing import Dict, Any, Optional
 from warden.warden_core import WardenHypervisor, ContainerLedgerSummary
 from warden.oom_watchdog import RecklessnessWatchdog
 from warden.unified_memory_swap import BlackwellUnifiedAllocator
+
+# SOTA Fix Bug 3: Multiprocessing Isolation for SQLite Audit Loop
+def _audit_worker_process(swarm_size: int, state_dir: str, stop_event: multiprocessing.Event):
+    warden = WardenHypervisor(swarm_size=swarm_size, state_dir=state_dir)
+    while not stop_event.is_set():
+        try:
+            warden.run_audit_cycle()
+        except Exception as e:
+            logger.error(f"Audit cycle failed: {e}")
+        time.sleep(5.0)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] (ComputeServer) %(message)s")
 logger = logging.getLogger("ComputeServer")
@@ -149,16 +161,24 @@ class WardenComputeServer:
         WardenAPIHandler.watchdog = self.watchdog
         WardenAPIHandler.unified_allocator = self.unified_allocator
         self.server = HTTPServer(("0.0.0.0", self.port), WardenAPIHandler)
+        self._stop_event = multiprocessing.Event()
+        self._audit_process = multiprocessing.Process(
+            target=_audit_worker_process, 
+            args=(swarm_size, state_dir, self._stop_event), 
+            daemon=True
+        )
 
     def start(self):
         """Starts the API server and OOM watchdog."""
         logger.info(f"Starting Warden Compute Server on port {self.port}...")
         self.watchdog.start_monitoring()
+        self._audit_process.start()
         try:
             self.server.serve_forever()
         except KeyboardInterrupt:
             logger.info("Shutting down Warden Compute Server...")
         finally:
+            self._stop_event.set()
             self.watchdog.stop_monitoring()
             self.server.server_close()
 

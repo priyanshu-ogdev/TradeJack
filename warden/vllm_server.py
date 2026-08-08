@@ -62,9 +62,12 @@ class SharedBrainvLLM:
         ]
         
         logger.info(f"Launching vLLM Shared Brain with PagedAttention: {' '.join(cmd)}")
+        vllm_env = os.environ.copy()
+        vllm_env["CUDA_VISIBLE_DEVICES"] = "0"
+        
         try:
             # Launch in background; in production environment on Grace Blackwell this binds to CUDA
-            self._server_process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            self._server_process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=vllm_env)
             logger.info("vLLM server subprocess initialized.")
         except Exception as e:
             logger.error(f"Failed to launch vLLM server: {e}")

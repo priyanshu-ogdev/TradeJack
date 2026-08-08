@@ -71,7 +71,7 @@ else:
 
 class AttentionIsAllYouNeedModel:
     """Positional-Encoded Causal Transformer (`Stock-Prediction-Models/deep-learning/attention-is-all-you-need`)."""
-    def __init__(self, input_dim: int = 8, d_model: int = 128, nhead: int = 8, num_layers: int = 4):
+    def __init__(self, input_dim: int = 5, d_model: int = 128, nhead: int = 8, num_layers: int = 4):
         self.model_name = "Attention-is-all-you-Need"
         self.input_dim = input_dim
         self.d_model = d_model
@@ -98,7 +98,7 @@ class AttentionIsAllYouNeedModel:
 
 class LSTMSeq2SeqVAEModel:
     """LSTM Sequence-to-Sequence Variational Autoencoder (`deep-learning/lstm-seq2seq-vae`)."""
-    def __init__(self, input_dim: int = 8, hidden_dim: int = 64, latent_dim: int = 16):
+    def __init__(self, input_dim: int = 5, hidden_dim: int = 64, latent_dim: int = 16):
         self.model_name = "LSTM-Seq2Seq-VAE"
         self.input_dim = input_dim
         if TORCH_AVAILABLE:
@@ -131,7 +131,7 @@ class LSTMSeq2SeqVAEModel:
 
 class GRUSeq2SeqVAEModel:
     """GRU Sequence-to-Sequence Variational Autoencoder (`deep-learning/gru-seq2seq-vae`)."""
-    def __init__(self, input_dim: int = 8, hidden_dim: int = 64, latent_dim: int = 16):
+    def __init__(self, input_dim: int = 5, hidden_dim: int = 64, latent_dim: int = 16):
         self.model_name = "GRU-Seq2Seq-VAE"
         self.input_dim = input_dim
         if TORCH_AVAILABLE:
@@ -162,7 +162,7 @@ class GRUSeq2SeqVAEModel:
 
 class StackingEncoderEnsembleModel:
     """Stacking Autoencoder & Multi-Path Classifier Ensemble (`stacking/stack-encoder-ensemble-xgb`)."""
-    def __init__(self, input_dim: int = 8, hidden_dim: int = 32):
+    def __init__(self, input_dim: int = 5, hidden_dim: int = 32):
         self.model_name = "Stacking-Encoder-Ensemble"
         self.input_dim = input_dim
         if TORCH_AVAILABLE:
@@ -188,7 +188,7 @@ class StackingEncoderEnsembleModel:
 
 class StackRNNARIMAXGBModel:
     """Hybrid RNN + Statistical Momentum Stacking Model (`stacking/stack-rnn-arima-xgb`)."""
-    def __init__(self, input_dim: int = 8, hidden_dim: int = 32):
+    def __init__(self, input_dim: int = 5, hidden_dim: int = 32):
         self.model_name = "Stack-RNN-ARIMA-XGB"
         self.input_dim = input_dim
         if TORCH_AVAILABLE:
@@ -213,7 +213,7 @@ class StackRNNARIMAXGBModel:
 
 class DilatedCNNSeq2SeqModel:
     """Stacked Residual Causal Dilated CNN (`deep-learning/dilated-cnn-seq2seq`)."""
-    def __init__(self, input_dim: int = 8, channels: int = 64):
+    def __init__(self, input_dim: int = 5, channels: int = 64):
         self.model_name = "Dilated-CNN-Seq2seq"
         self.input_dim = input_dim
         self.channels = channels
@@ -242,7 +242,7 @@ class DilatedCNNSeq2SeqModel:
 
 class CNNSeq2SeqModel:
     """Causal 1D Convolutional Sequence Model (`deep-learning/cnn-seq2seq`)."""
-    def __init__(self, input_dim: int = 8, channels: int = 32):
+    def __init__(self, input_dim: int = 5, channels: int = 32):
         self.model_name = "CNN-Seq2seq"
         self.input_dim = input_dim
         if TORCH_AVAILABLE:
@@ -265,7 +265,7 @@ class CNNSeq2SeqModel:
 
 class LSTMSeq2SeqModel:
     """Standard LSTM Sequence-to-Sequence (`deep-learning/lstm-seq2seq`)."""
-    def __init__(self, input_dim: int = 8, hidden_dim: int = 64):
+    def __init__(self, input_dim: int = 5, hidden_dim: int = 64):
         self.model_name = "LSTM-Seq2seq"
         self.input_dim = input_dim
         if TORCH_AVAILABLE:
@@ -285,7 +285,7 @@ class LSTMSeq2SeqModel:
 
 class BiLSTMSeq2SeqModel:
     """Bidirectional LSTM Sequence Model (`deep-learning/bidirectional-lstm-seq2seq`)."""
-    def __init__(self, input_dim: int = 8, hidden_dim: int = 64):
+    def __init__(self, input_dim: int = 5, hidden_dim: int = 64):
         self.model_name = "Bidirectional-LSTM-Seq2seq"
         self.input_dim = input_dim
         if TORCH_AVAILABLE:
@@ -305,7 +305,7 @@ class BiLSTMSeq2SeqModel:
 
 class GRUSeq2SeqModel:
     """Standard GRU Sequence-to-Sequence (`deep-learning/gru-seq2seq`)."""
-    def __init__(self, input_dim: int = 8, hidden_dim: int = 64):
+    def __init__(self, input_dim: int = 5, hidden_dim: int = 64):
         self.model_name = "GRU-Seq2seq"
         self.input_dim = input_dim
         if TORCH_AVAILABLE:
@@ -325,7 +325,7 @@ class GRUSeq2SeqModel:
 
 class VanillaSeq2SeqModel:
     """Vanilla RNN Sequence-to-Sequence (`deep-learning/vanilla`)."""
-    def __init__(self, input_dim: int = 8, hidden_dim: int = 32):
+    def __init__(self, input_dim: int = 5, hidden_dim: int = 32):
         self.model_name = "Vanilla-Seq2seq"
         self.input_dim = input_dim
         if TORCH_AVAILABLE:
@@ -345,7 +345,7 @@ class VanillaSeq2SeqModel:
 
 class ActorCriticAgentModel:
     """Actor-Critic Policy & Value Network (`agent/actor-critic-agent`)."""
-    def __init__(self, input_dim: int = 8, hidden_dim: int = 32):
+    def __init__(self, input_dim: int = 5, hidden_dim: int = 32):
         self.model_name = "Actor-Critic-Agent"
         self.input_dim = input_dim
         if TORCH_AVAILABLE:
@@ -370,7 +370,7 @@ class ActorCriticAgentModel:
 
 class ActorCriticDuelAgentModel:
     """Dueling Advantage Actor-Critic (`agent/actor-critic-duel-agent`)."""
-    def __init__(self, input_dim: int = 8, hidden_dim: int = 32):
+    def __init__(self, input_dim: int = 5, hidden_dim: int = 32):
         self.model_name = "Actor-Critic-Duel-Agent"
         self.input_dim = input_dim
         if TORCH_AVAILABLE:
@@ -394,7 +394,7 @@ class ActorCriticDuelAgentModel:
 
 class ActorCriticRecurrentAgentModel:
     """Recurrent LSTM Actor-Critic (`agent/actor-critic-recurrent-agent`)."""
-    def __init__(self, input_dim: int = 8, hidden_dim: int = 32):
+    def __init__(self, input_dim: int = 5, hidden_dim: int = 32):
         self.model_name = "Actor-Critic-Recurrent-Agent"
         self.input_dim = input_dim
         if TORCH_AVAILABLE:
@@ -416,7 +416,7 @@ class ActorCriticRecurrentAgentModel:
 
 class DoubleDuelRecurrentQAgentModel:
     """Double Dueling Recurrent Q-Learning Agent (`agent/double-duel-recurrent-q-learning-agent`)."""
-    def __init__(self, input_dim: int = 8, hidden_dim: int = 32):
+    def __init__(self, input_dim: int = 5, hidden_dim: int = 32):
         self.model_name = "Double-Duel-Recurrent-Q-Learning-Agent"
         self.input_dim = input_dim
         if TORCH_AVAILABLE:
@@ -441,7 +441,7 @@ class DoubleDuelRecurrentQAgentModel:
 
 class DeepQLearningModel:
     """Dueling Q-Network Micro-Scalper (`agent/duel-q-learning-agent` / `Deep-Q-learning`)."""
-    def __init__(self, input_dim: int = 8, hidden_dim: int = 32):
+    def __init__(self, input_dim: int = 5, hidden_dim: int = 32):
         self.model_name = "Deep-Q-learning"
         self.input_dim = input_dim
         self.hidden_dim = hidden_dim
@@ -477,7 +477,7 @@ class DeepQLearningModel:
 
 class DoubleQLearningModel:
     """Double Q-Learning Agent (`agent/double-q-learning-agent`)."""
-    def __init__(self, input_dim: int = 8, hidden_dim: int = 16):
+    def __init__(self, input_dim: int = 5, hidden_dim: int = 16):
         self.model_name = "Double-Q-learning-Agent"
         self.input_dim = input_dim
         if TORCH_AVAILABLE:
@@ -495,7 +495,7 @@ class DoubleQLearningModel:
 
 class RecurrentQLearningModel:
     """Recurrent Q-Learning Agent (`agent/recurrent-q-learning-agent`)."""
-    def __init__(self, input_dim: int = 8, hidden_dim: int = 16):
+    def __init__(self, input_dim: int = 5, hidden_dim: int = 16):
         self.model_name = "Recurrent-Q-learning-Agent"
         self.input_dim = input_dim
         if TORCH_AVAILABLE:
@@ -515,7 +515,7 @@ class RecurrentQLearningModel:
 
 class CuriosityQLearningModel:
     """Intrinsic Curiosity Q-Learning Agent with Forward Dynamics Model (`agent/curiosity-q-learning-agent`)."""
-    def __init__(self, input_dim: int = 8, hidden_dim: int = 16):
+    def __init__(self, input_dim: int = 5, hidden_dim: int = 16):
         self.model_name = "Curiosity-Q-learning-Agent"
         self.input_dim = input_dim
         if TORCH_AVAILABLE:
@@ -550,7 +550,7 @@ class CuriosityQLearningModel:
 
 class NeuroEvolutionNESModel:
     """Natural Evolution Strategies (NES) Parameter Agent (`agent/neuro-evolution-agent`)."""
-    def __init__(self, input_dim: int = 8, hidden_dim: int = 16):
+    def __init__(self, input_dim: int = 5, hidden_dim: int = 16):
         self.model_name = "Neuro-Evolution-Agent"
         self.input_dim = input_dim
         self.weights = {
@@ -587,7 +587,7 @@ class NeuroEvolutionNESModel:
 
 class NeuroEvolutionNoveltySearchModel:
     """Neuro-Evolution Novelty Search Agent (`agent/neuro-evolution-novelty-search-agent`)."""
-    def __init__(self, input_dim: int = 8, hidden_dim: int = 16):
+    def __init__(self, input_dim: int = 5, hidden_dim: int = 16):
         self.model_name = "Neuro-Evolution-Novelty-Search-Agent"
         self.input_dim = input_dim
         if TORCH_AVAILABLE:
@@ -617,7 +617,7 @@ class NeuroEvolutionNoveltySearchModel:
 
 class MovingAverageMomentumModel:
     """Algorithmic Moving Average & Statistical Momentum Scalper (`agent/moving-average-agent` / `abcd-strategy-agent`)."""
-    def __init__(self, input_dim: int = 8, short_window: int = 5, long_window: int = 20):
+    def __init__(self, input_dim: int = 5, short_window: int = 5, long_window: int = 20):
         self.model_name = "Moving-Average-Agent"
         self.short_window = short_window
         self.long_window = long_window
@@ -635,6 +635,91 @@ class MovingAverageMomentumModel:
         long_ma = np.mean(prices[-self.long_window:])
         diff = (short_ma - long_ma) / (long_ma + 1e-8)
         return float(np.clip(diff * 50.0, -1.0, 1.0))
+
+
+class PolicyGradientAgentModel:
+    """Policy Gradient Agent (`agent/4.policy-gradient-agent.ipynb`)."""
+    def __init__(self, input_dim: int = 5, hidden_dim: int = 32):
+        self.model_name = "Policy-Gradient-Agent"
+        self.input_dim = input_dim
+        if TORCH_AVAILABLE:
+            self.net = nn.Sequential(nn.Linear(input_dim, hidden_dim), nn.ReLU(), nn.Linear(hidden_dim, 3))
+        else:
+            self.weights = {"pg": np.random.normal(0, 0.05, (input_dim, 3)).astype(np.float32)}
+
+    def forward(self, x: Any) -> Any:
+        if TORCH_AVAILABLE and isinstance(self.net, nn.Module):
+            if x.dim() == 3: x = torch.mean(x, dim=1)
+            elif x.dim() == 1: x = x.unsqueeze(0)
+            return self.net(x)
+        return np.array([0.2, 0.7, 0.1], dtype=np.float32)
+
+
+class DoubleDuelQLearningModel:
+    """Double Dueling Q-Learning Agent (`agent/11.double-duel-q-learning-agent.ipynb`)."""
+    def __init__(self, input_dim: int = 5, hidden_dim: int = 32):
+        self.model_name = "Double-Duel-Q-Learning-Agent"
+        self.input_dim = input_dim
+        if TORCH_AVAILABLE:
+            self.fc_feat = nn.Sequential(nn.Linear(input_dim, hidden_dim), nn.ReLU())
+            self.fc_val = nn.Linear(hidden_dim, 1)
+            self.fc_adv = nn.Linear(hidden_dim, 3)
+            self.net = nn.ModuleList([self.fc_feat, self.fc_val, self.fc_adv])
+        else:
+            self.weights = {"ddq": np.random.normal(0, 0.05, (input_dim, 3)).astype(np.float32)}
+
+    def forward(self, x: Any) -> Any:
+        if TORCH_AVAILABLE and hasattr(self, "fc_feat"):
+            if x.dim() == 3: x = torch.mean(x, dim=1)
+            elif x.dim() == 1: x = x.unsqueeze(0)
+            feat = self.fc_feat(x)
+            adv = self.fc_adv(feat)
+            return self.fc_val(feat) + adv - torch.mean(adv, dim=1, keepdim=True)
+        return np.array([0.1, 0.5, -0.2], dtype=np.float32)
+
+
+class ActorCriticDuelRecurrentAgentModel:
+    """Actor-Critic Duel Recurrent Agent (`agent/17.actor-critic-duel-recurrent-agent.ipynb`)."""
+    def __init__(self, input_dim: int = 5, hidden_dim: int = 32):
+        self.model_name = "Actor-Critic-Duel-Recurrent-Agent"
+        self.input_dim = input_dim
+        if TORCH_AVAILABLE:
+            self.rnn = nn.GRU(input_dim, hidden_dim, batch_first=True)
+            self.val = nn.Linear(hidden_dim, 1)
+            self.adv = nn.Linear(hidden_dim, 3)
+            self.net = nn.ModuleList([self.rnn, self.val, self.adv])
+        else:
+            self.weights = {"acdr": np.random.normal(0, 0.05, (input_dim, 3)).astype(np.float32)}
+
+    def forward(self, x: Any) -> Any:
+        if TORCH_AVAILABLE and hasattr(self, "rnn"):
+            if x.dim() == 2: x = x.unsqueeze(0)
+            _, h_n = self.rnn(x)
+            h = h_n[-1]
+            adv = self.adv(h)
+            return self.val(h) + (adv[:, 1] - adv[:, 2]).unsqueeze(-1)
+        return np.array([0.2, 0.6, -0.3], dtype=np.float32)
+
+
+class RecurrentCuriosityQLearningModel:
+    """Recurrent Curiosity Q-Learning Agent (`agent/19.recurrent-curiosity-q-learning-agent.ipynb`)."""
+    def __init__(self, input_dim: int = 5, hidden_dim: int = 16):
+        self.model_name = "Recurrent-Curiosity-Q-Learning-Agent"
+        self.input_dim = input_dim
+        if TORCH_AVAILABLE:
+            self.rnn = nn.GRU(input_dim, hidden_dim, batch_first=True)
+            self.q_net = nn.Linear(hidden_dim, 3)
+            self.dynamics_net = nn.Sequential(nn.Linear(input_dim + 1, hidden_dim), nn.ReLU(), nn.Linear(hidden_dim, input_dim))
+            self.net = nn.ModuleList([self.rnn, self.q_net, self.dynamics_net])
+        else:
+            self.weights = {"rcq": np.random.normal(0, 0.05, (input_dim, 3)).astype(np.float32)}
+
+    def forward(self, x: Any) -> Any:
+        if TORCH_AVAILABLE and hasattr(self, "rnn"):
+            if x.dim() == 2: x = x.unsqueeze(0)
+            _, h_n = self.rnn(x)
+            return self.q_net(h_n[-1])
+        return np.array([0.1, 0.6, -0.1], dtype=np.float32)
 
 
 # ─── UNIVERSAL REGISTRY MANAGER (`TradeJackModelRegistry`) ───
@@ -685,6 +770,12 @@ class TradeJackModelRegistry:
         self._register("Neuro-Evolution-Agent", 3, "neuro_evolution", 80.0, "Natural Evolution Strategies (NES)", NeuroEvolutionNESModel)
         self._register("Neuro-Evolution-Novelty-Search-Agent", 3, "neuro_evolution", 120.0, "Novelty Behavioral Search Agent", NeuroEvolutionNoveltySearchModel)
         self._register("Moving-Average-Agent", 3, "q_learning", 20.0, "Algorithmic Moving Average Momentum Scalper", MovingAverageMomentumModel)
+        
+        # Newly added Missing Architectures
+        self._register("Policy-Gradient-Agent", 3, "actor_critic", 180.0, "Policy Gradient Optimizer", PolicyGradientAgentModel)
+        self._register("Double-Duel-Q-Learning-Agent", 3, "q_learning", 240.0, "Double Dueling Q-Learning", DoubleDuelQLearningModel)
+        self._register("Actor-Critic-Duel-Recurrent-Agent", 2, "actor_critic", 890.0, "Recurrent Dueling Advantage Actor-Critic", ActorCriticDuelRecurrentAgentModel)
+        self._register("Recurrent-Curiosity-Q-Learning-Agent", 3, "q_learning", 340.0, "Recurrent Intrinsic Curiosity Scalper", RecurrentCuriosityQLearningModel)
 
     def get_model_card(self, model_name: str) -> Optional[ModelCard]:
         return self.cards.get(model_name)
@@ -693,7 +784,7 @@ class TradeJackModelRegistry:
         """Returns all model cards whose tier requirement is greater than or equal to `max_tier` (where Tier 3 is lowest compute, Tier 1 is highest)."""
         return [card for card in self.cards.values() if card.tier_requirement >= max_tier]
 
-    def build_model(self, model_name: str, input_dim: int = 8, **kwargs) -> Any:
+    def build_model(self, model_name: str, input_dim: int = 5, **kwargs) -> Any:
         """Instantiates the live model architecture by name."""
         card = self.get_model_card(model_name)
         if not card:

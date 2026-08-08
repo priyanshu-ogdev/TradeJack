@@ -16,6 +16,8 @@ import asyncio
 import logging
 import subprocess
 import threading
+import signal
+import atexit
 from concurrent.futures import ThreadPoolExecutor
 from typing import Dict, Any, List, Optional
 
@@ -32,6 +34,8 @@ from warden.warden_core import WardenHypervisor
 from warden.unified_memory_swap import BlackwellUnifiedAllocator
 from warden.oom_watchdog import RecklessnessWatchdog
 from warden.lineage_vector_db import LineageVectorDB
+from warden.compute_server import WardenComputeServer
+from warden.vllm_server import SharedBrainvLLM
 from data_forge.parquet_ingest import ParquetIngestPipeline
 from swarm.child_agent import SovereignChild
 
@@ -53,6 +57,9 @@ class GenesisPrimeLauncher:
         self.warden: Optional[WardenHypervisor] = None
         self.watchdog: Optional[RecklessnessWatchdog] = None
         self.vector_db: Optional[LineageVectorDB] = None
+        self.compute_server: Optional[WardenComputeServer] = None
+        self.vllm_server: Optional[SharedBrainvLLM] = None
+        self.compute_thread: Optional[threading.Thread] = None
 
     def verify_hardware_capabilities(self) -> Dict[str, Any]:
         """
@@ -75,13 +82,25 @@ class GenesisPrimeLauncher:
 
     def boot_warden_infrastructure(self):
         """
-        Initializes the Warden Hypervisor, OOM Watchdog, and Lineage Vector DB.
+        Initializes the Warden Hypervisor, OOM Watchdog, Lineage Vector DB, Compute Server, and vLLM.
         """
         logger.info("================== BOOTING WARDEN HYPERVISOR ==================")
-        self.warden = WardenHypervisor(swarm_size=self.num_containers, enable_hardware_mig=self.is_dgx_blackwell)
-        self.watchdog = RecklessnessWatchdog(state_dir=self.state_dir)
+        # 1. Boot vLLM Shared Brain
+        self.vllm_server = SharedBrainvLLM()
+        self.vllm_server.launch_server()
+        
+        # 2. Boot Warden Compute API Server (runs Warden core + Watchdog + Audit Loop)
+        self.compute_server = WardenComputeServer(port=8080, state_dir=self.state_dir, swarm_size=self.num_containers)
+        self.compute_thread = threading.Thread(target=self.compute_server.start, daemon=True)
+        self.compute_thread.start()
+        
+        # Extract references
+        self.warden = self.compute_server.warden
+        self.watchdog = self.compute_server.watchdog
         self.vector_db = LineageVectorDB(db_path=os.path.join(self.state_dir, "chroma_db"))
-        logger.info(f"Warden initialized with {self.num_containers} registered Child endpoints ($10.00 base equity each).")
+        
+        time.sleep(2.0)
+        logger.info(f"Warden infrastructure initialized and online for {self.num_containers} child endpoints.")
 
     async def bootstrap_data_forge(self):
         """
@@ -143,16 +162,44 @@ class GenesisPrimeLauncher:
             logger.info("Local Swarm Crucible Simulation concluded across all 50 containers.")
             return results
 
-    async def run_genesis(self, simulate_locally: bool = True, max_steps: int = 50) -> Dict[str, Any]:
+    async def run_genesis(self, max_steps: int = 1000, simulate_locally: bool = False):
         """
-        Master execution sequence.
+        Executes the master Crucible Loop.
         """
+        logger.info("================== GENESIS PRIME IGNITION ==================")
         start_time = time.time()
         hw_report = self.verify_hardware_capabilities()
+        
+        # SOTA Fix Bug 5: Strict Environment Masking
+        # Mask the main orchestrator process from the GPU to prevent VRAM fragmentation for vLLM
+        if self.is_dgx_blackwell:
+            os.environ["CUDA_VISIBLE_DEVICES"] = ""
+            
         self.boot_warden_infrastructure()
+        
+        # SOTA Fix Bug 1: The Reaper Protocol
+        def reap_zombies():
+            logger.critical("REAPER PROTOCOL: Tearing down sub-services...")
+            if self.vllm_server:
+                self.vllm_server.stop_server()
+            if self.compute_server and hasattr(self.compute_server, "_stop_event"):
+                self.compute_server._stop_event.set()
+                if hasattr(self.compute_server, '_audit_process') and self.compute_server._audit_process:
+                    self.compute_server._audit_process.terminate()
+                    self.compute_server._audit_process.join(timeout=2.0)
+                    
+        atexit.register(reap_zombies)
+        signal.signal(signal.SIGINT, lambda s, f: reap_zombies() or sys.exit(0))
+        signal.signal(signal.SIGTERM, lambda s, f: reap_zombies() or sys.exit(0))
+
         await self.bootstrap_data_forge()
         
-        swarm_results = self.spawn_sovereign_swarm(simulate_locally=simulate_locally, max_steps_per_child=max_steps)
+        try:
+            swarm_results = self.spawn_sovereign_swarm(simulate_locally=simulate_locally, max_steps_per_child=max_steps)
+        finally:
+            logger.info("================== SHUTTING DOWN WARDEN INFRASTRUCTURE ==================")
+            reap_zombies()
+            atexit.unregister(reap_zombies)
         
         # Calculate aggregate swarm statistics
         total_eq = sum(r.get("final_equity", 10.0) for r in swarm_results)

@@ -12,6 +12,7 @@ import uuid
 import hmac
 import hashlib
 import logging
+import numpy as np
 from typing import Dict, Any, List, Optional
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] (SocialRelay) %(message)s")
@@ -75,7 +76,8 @@ class SocialRelayBridge:
         equity: float,
         sharpe_ratio: float,
         state_dict_path: str,
-        description: str = "High-Sharpe Dilated CNN on BTC-USDT flash crash"
+        description: str = "High-Sharpe Dilated CNN on BTC-USDT flash crash",
+        regime_vector: Optional[List[float]] = None
     ) -> str:
         """
         Registers current lineage performance and state_dict pointer into ChromaDB and local relay directory.
@@ -92,7 +94,8 @@ class SocialRelayBridge:
             "sharpe_ratio": sharpe_ratio,
             "state_dict_path": state_dict_path,
             "timestamp": timestamp,
-            "model_type": description.split("(")[-1].split(")")[0] if "(" in description else "Dilated-CNN-Seq2seq"
+            "model_type": description.split("(")[-1].split(")")[0] if "(" in description else "Dilated-CNN-Seq2seq",
+            "regime_vector": regime_vector
         }
         content = json.dumps(metadata, sort_keys=True)
         sig = sign_message(content, timestamp, nonce, self.child_id)
@@ -123,7 +126,7 @@ class SocialRelayBridge:
         logger.info(f"[SOCIAL RELAY] Child {self.child_id} broadcasted signed insight '{lineage_id}' (Sharpe {sharpe_ratio:.2f}).")
         return lineage_id
 
-    def query_top_peers(self, min_sharpe: float = 1.0, limit: int = 5) -> List[Dict[str, Any]]:
+    def query_top_peers(self, min_sharpe: float = 1.0, limit: int = 5, current_regime_vector: Optional[List[float]] = None) -> List[Dict[str, Any]]:
         """
         Queries top performing peer models across the relay directory and vector DB after verifying cryptographic signatures.
         """
@@ -141,6 +144,14 @@ class SocialRelayBridge:
                             continue
                         meta = data.get("metadata", {})
                         if meta.get("child_id") != self.child_id and meta.get("sharpe_ratio", 0.0) >= min_sharpe:
+                            if current_regime_vector is not None and "regime_vector" in meta and meta["regime_vector"] is not None:
+                                v1 = np.array(current_regime_vector)
+                                v2 = np.array(meta["regime_vector"])
+                                if np.linalg.norm(v1) > 0 and np.linalg.norm(v2) > 0:
+                                    cos_sim = np.dot(v1, v2) / (np.linalg.norm(v1) * np.linalg.norm(v2))
+                                    if cos_sim > 0.90:
+                                        logger.info(f"Rejected peer {meta['child_id']} due to high regime similarity ({cos_sim:.2f}). Enforcing alpha diversity.")
+                                        continue
                             results.append(data)
                 except Exception:
                     continue
@@ -189,6 +200,6 @@ class SocialRelayBridge:
 if __name__ == "__main__":
     logger.info("Testing SocialRelayBridge standalone...")
     relay = SocialRelayBridge(child_id=1)
-    relay.broadcast_market_insight(equity=14.50, sharpe_ratio=2.3, state_dict_path="state/child_1/weights.pt")
-    peers = relay.query_top_peers(min_sharpe=1.0)
+    relay.broadcast_market_insight(equity=14.50, sharpe_ratio=2.3, state_dict_path="state/child_1/weights.pt", regime_vector=[1.0, 0.5, -0.2])
+    peers = relay.query_top_peers(min_sharpe=1.0, current_regime_vector=[-1.0, -0.5, 0.2])
     print("Found top peers:", json.dumps(peers, indent=2))

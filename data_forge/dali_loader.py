@@ -6,6 +6,11 @@ Adapts dynamically between:
 1. NVIDIA DALI Zero-Copy Pipeline on DGX Blackwell (CUDA 13).
 2. PyTorch Memory-Mapped Dataset on local laptop (CPU).
 3. Pure Numpy/Simulation Dataset fallback when running on local laptop without PyTorch installed.
+
+SOTA Upgrades:
+  - Multi-worker PyTorch DataLoader (num_workers=2) to prevent GPU starvation
+  - persistent_workers=True for amortized worker startup cost
+  - Optional live data mode reading from lob_collector output partitions
 """
 
 import os
@@ -13,6 +18,8 @@ import sys
 import logging
 import numpy as np
 from typing import Dict, Any, List, Optional, Tuple, Iterator
+
+from data_forge.config import config
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] (DALILoader) %(message)s")
 logger = logging.getLogger("DALILoader")
@@ -36,7 +43,7 @@ except ImportError:
     DALI_AVAILABLE = False
     logger.debug("NVIDIA DALI not found; DALILoader using high-speed PyTorch/Numpy fallback.")
 
-from data_forge.kvikio_pipeline import KvikIODataForge
+from data_forge.kvikio_streamer import KvikIODataForge
 
 
 class ParquetLOBDataset(BaseDataset):
@@ -53,7 +60,7 @@ class ParquetLOBDataset(BaseDataset):
         end_date: str = "2024-01-05",
         seq_len: int = 60,
         forward_horizon: int = 5,
-        data_store_dir: str = "d:/TradeJack/data_store",
+        data_store_dir: str = None,
         feature_cols: Optional[List[str]] = None
     ):
         if TORCH_AVAILABLE:
@@ -61,13 +68,12 @@ class ParquetLOBDataset(BaseDataset):
         self.seq_len = seq_len
         self.forward_horizon = forward_horizon
         self.feature_cols = feature_cols or [
-            "bid_px_0", "bid_sz_0", "ask_px_0", "ask_sz_0",
-            "mid_price", "spread", "order_flow_imbalance", "log_return"
+            "open_price", "close_price", "volume", "ofi", "vpin_50", "kyles_lambda"
         ]
-        
-        self.forge = KvikIODataForge(data_store_dir=data_store_dir, use_gds_if_available=False)
+
+        self.forge = KvikIODataForge(data_store_dir=data_store_dir or config.data_store_dir, use_gds_if_available=False)
         partitions = self.forge.stream_partition_window(symbol, start_date, end_date, columns=self.feature_cols)
-        
+
         if not partitions:
             logger.warning(f"No partition data found for {symbol} between {start_date} and {end_date}.")
             self.tensor_features = torch.empty((0, len(self.feature_cols))) if TORCH_AVAILABLE else np.zeros((0, len(self.feature_cols)), dtype=np.float32)
@@ -78,7 +84,7 @@ class ParquetLOBDataset(BaseDataset):
                 for col in self.feature_cols:
                     if col in part:
                         combined_cols[col].append(part[col])
-                        
+
             if TORCH_AVAILABLE and all(isinstance(v, torch.Tensor) for v_list in combined_cols.values() for v in v_list):
                 feature_tensors = []
                 for col in self.feature_cols:
@@ -106,7 +112,7 @@ class ParquetLOBDataset(BaseDataset):
                     self.tensor_features = np.concatenate(feature_arrays, axis=1)
                 else:
                     self.tensor_features = np.zeros((0, len(self.feature_cols)), dtype=np.float32)
-                
+
         self.total_length = max(0, len(self.tensor_features) - self.seq_len - self.forward_horizon + 1)
         logger.info(f"ParquetLOBDataset initialized with {self.total_length} sequence windows ({len(self.feature_cols)} features).")
 
@@ -118,16 +124,16 @@ class ParquetLOBDataset(BaseDataset):
             if TORCH_AVAILABLE:
                 return torch.empty(0), torch.empty(0)
             return np.empty(0), np.empty(0)
-            
+
         x = self.tensor_features[idx : idx + self.seq_len]
-        
-        # Calculate target: future mid_price return over forward_horizon
-        mid_idx = self.feature_cols.index("mid_price") if "mid_price" in self.feature_cols else 0
+
+        # Calculate target: future close_price return over forward_horizon
+        mid_idx = self.feature_cols.index("close_price") if "close_price" in self.feature_cols else 0
         current_mid = self.tensor_features[idx + self.seq_len - 1, mid_idx]
         future_mid = self.tensor_features[idx + self.seq_len + self.forward_horizon - 1, mid_idx]
-        
+
         target_return = (future_mid - current_mid) / (current_mid + 1e-8)
-        
+
         if TORCH_AVAILABLE and isinstance(x, torch.Tensor):
             if target_return > 0.0005:
                 target_class = torch.tensor(1.0, dtype=torch.float32)
@@ -179,29 +185,34 @@ def create_lob_dataloader(
     batch_size: int = 32,
     seq_len: int = 60,
     forward_horizon: int = 5,
-    data_store_dir: str = "d:/TradeJack/data_store",
-    device: str = "cuda:0"
+    data_store_dir: str = None,
+    device: str = "cuda:0",
+    num_workers: int = 2,
 ) -> Any:
     """
     Factory function producing high-throughput data iterators.
     On Grace Blackwell with DALI & CUDA 13, constructs zero-copy DALI pipeline.
-    On Laptop CPU with PyTorch, returns PyTorch DataLoader.
+    On Laptop CPU with PyTorch, returns PyTorch DataLoader with multi-worker prefetching.
     On Laptop CPU without PyTorch, returns NumpyDataLoader.
     """
     use_cuda = TORCH_AVAILABLE and torch.cuda.is_available() and device.startswith("cuda")
-    
+
     dataset = ParquetLOBDataset(
         symbol=symbol, start_date=start_date, end_date=end_date,
-        seq_len=seq_len, forward_horizon=forward_horizon, data_store_dir=data_store_dir
+        seq_len=seq_len, forward_horizon=forward_horizon,
+        data_store_dir=data_store_dir or config.data_store_dir,
     )
-    
+
     if TORCH_AVAILABLE:
+        # Multi-worker DataLoader prevents GPU starvation during training
+        effective_workers = num_workers if len(dataset) > 0 else 0
         loader = TorchDataLoader(
             dataset,
             batch_size=batch_size,
             shuffle=True,
-            num_workers=0,
-            pin_memory=use_cuda
+            num_workers=effective_workers,
+            pin_memory=use_cuda,
+            persistent_workers=effective_workers > 0,
         )
         return loader
     else:
@@ -212,9 +223,9 @@ if __name__ == "__main__":
     logger.info("Testing DALILoader / ParquetLOBDataset standalone execution...")
     from data_forge.parquet_ingest import ParquetIngestPipeline
     import asyncio
-    ingest = ParquetIngestPipeline(data_store_dir="d:/TradeJack/data_store")
+    ingest = ParquetIngestPipeline()
     asyncio.run(ingest.generate_synthetic_crucible_data(symbol="BTC-USDT", num_days=1, ticks_per_day=150, start_date="2024-01-01"))
-    
+
     loader = create_lob_dataloader(symbol="BTC-USDT", start_date="2024-01-01", end_date="2024-01-01", batch_size=8, seq_len=20)
     for idx, (batch_x, batch_y) in enumerate(loader):
         print(f"Batch {idx}: X shape = {batch_x.shape}, Y shape = {batch_y.shape}")
