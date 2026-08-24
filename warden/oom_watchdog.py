@@ -62,12 +62,20 @@ class RecklessnessWatchdog:
                 VALUES (?, ?, ?)
             """, (current_time, reason, lock_until))
             
-            # Phase 3 Event Sourcing Sync: Apply the $10 penalty via Tax Bridge so agent deducts natively
-            conn.execute("CREATE TABLE IF NOT EXISTS tax_assessments (id INTEGER PRIMARY KEY AUTOINCREMENT, child_id INTEGER, timestamp REAL, amount REAL, reason TEXT)")
+            # BUG-2 FIX: Apply the $10 penalty via Tax Bridge using the canonical tax_assessments schema.
+            # Schema from warden_core.init_child_ledger: (id, child_id, market_timestamp TEXT, tax_type TEXT, amount REAL)
+            # The old INSERT used (timestamp, reason) which don't exist — error was swallowed, penalty never applied.
             conn.execute("""
-                INSERT INTO tax_assessments (child_id, timestamp, amount, reason)
+                CREATE TABLE IF NOT EXISTS tax_assessments (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT, child_id INTEGER,
+                    market_timestamp TEXT, tax_type TEXT, amount REAL,
+                    UNIQUE(child_id, market_timestamp, tax_type)
+                )
+            """)
+            conn.execute("""
+                INSERT OR IGNORE INTO tax_assessments (child_id, market_timestamp, amount, tax_type)
                 VALUES (?, ?, ?, ?)
-            """, (child_id, current_time, self.penalty_dollars, "OOM_RECKLESSNESS_PENALTY"))
+            """, (child_id, str(current_time), self.penalty_dollars, "OOM_RECKLESSNESS_PENALTY"))
             
             conn.commit()
             conn.close()

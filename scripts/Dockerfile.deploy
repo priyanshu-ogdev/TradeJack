@@ -1,0 +1,70 @@
+# Dockerfile.deploy — TradeJack DEPLOYMENT IMAGE
+# ==================================================
+# This image is for FROZEN DEPLOYMENT ONLY.
+# It contains ZERO self-modification code paths.
+#
+# Segment 4 (BUG-11 FIX): Hard build-time separation from Dockerfile.child.
+# The Crucible evolves. The Deployment freezes.
+#
+# Excluded from this image (Crucible-only):
+#   - swarm/self_mod_manager.py    (autonomous code rewriting)
+#   - swarm/rl_mechanics.py        (PBT, HER, GAN -- training-only)
+#   - swarm/git_rollback.py        (weight rollback -- training-only)
+#   - swarm/ewc_optimizer.py       (EWC -- training-only)
+#   - data_forge/synthetic_diffusion.py  (training data generation)
+#
+# Included (inference + live trading only):
+#   - physics/                     (LOB env, portfolio accounting)
+#   - data_forge/ (streaming only) (KvikIO, DALI, parquet ingest, features)
+#   - swarm/model_registry.py      (model architectures -- inference only)
+#   - swarm/child_agent.py         (deployment variant -- no self-mod calls)
+#   - escrow/                      (P2P bridge for live settlement)
+#   - scripts/deploy_config.py     (frozen deployment configuration)
+
+FROM nvidia/cuda:12.4.1-cudnn-runtime-ubuntu22.04
+
+LABEL maintainer="TradeJack Deployment" \
+      version="1.0" \
+      description="TradeJack frozen deployment agent -- no self-modification"
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3.11 \
+    python3-pip \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+COPY requirements_deploy.txt ./
+RUN pip3 install --no-cache-dir -r requirements_deploy.txt
+
+# Core physics engine
+COPY physics/ ./physics/
+
+# Data forge streaming (NO synthetic_diffusion.py)
+COPY data_forge/__init__.py ./data_forge/
+COPY data_forge/config.py ./data_forge/
+COPY data_forge/kvikio_streamer.py ./data_forge/
+COPY data_forge/dali_loader.py ./data_forge/
+COPY data_forge/parquet_ingest.py ./data_forge/
+COPY data_forge/feature_engineering.py ./data_forge/
+COPY data_forge/storage_manager.py ./data_forge/
+COPY data_forge/schema.py ./data_forge/
+
+# Swarm inference modules ONLY
+# NOTE: self_mod_manager.py, rl_mechanics.py, git_rollback.py, ewc_optimizer.py EXCLUDED
+COPY swarm/__init__.py ./swarm/
+COPY swarm/model_registry.py ./swarm/
+COPY swarm/child_agent.py ./swarm/
+
+# Escrow bridge
+COPY escrow/ ./escrow/
+
+# Deployment frozen config
+COPY scripts/deploy_config.py ./scripts/
+
+RUN mkdir -p /app/state /app/data_store
+
+ENV TRADEJACK_MODE=DEPLOYMENT
+ENV TRADEJACK_SELF_MOD_ENABLED=false
+
+CMD ["python3", "-m", "swarm.child_agent", "--mode", "deploy", "--config", "scripts/deploy_config.py"]

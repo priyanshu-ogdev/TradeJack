@@ -171,8 +171,15 @@ class PortfolioAccountingEngine:
         ))
         
         return {
-            "equity": self.equity, "max_drawdown": self.max_drawdown, 
-            "rolling_sortino": r_sortino, "last_hwm": self.last_hwm_market_timestamp
+            "equity": self.equity,
+            "cash": self.cash,
+            "peak_equity": self.peak_equity,
+            "max_drawdown": self.max_drawdown,
+            "sharpe_ratio": lt_sharpe,        # alias for test_physics.py compatibility
+            "lifetime_sharpe": lt_sharpe,
+            "rolling_sortino": r_sortino,
+            "ticks_active": self.ticks_active,
+            "last_hwm": self.last_hwm_market_timestamp,
         }
 
     def _flush_worker(self):

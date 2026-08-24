@@ -109,20 +109,34 @@ class PopulationBasedTrainingEngine:
 
     def execute_pbt_step(self, population_status: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """
-        Takes `population_status` (list of dicts with `child_id`, `equity`, `sharpe_ratio`, `weights_path`, `learning_rate`, `model_name`, `tier`),
-        sorts by fitness (Sharpe * Equity), and mutates the bottom 20% by copying top 20% weights + noise AND mutating model architecture if stagnant.
+        Segment 3 — BUG-13 FIX: Fitness now uses Sortino ratio (risk-adjusted, downside-only variance).
+        Old: sharpe_ratio * equity was dimensionally wrong — dollars * dimensionless.
+        New: sortino_ratio with a minimum trade-count guard (ticks_active < 50 = ineligible).
+        Walk-forward evaluation across randomized start-time windows is wired at the
+        population_status collection level in WardenCore.run_audit_cycle().
         """
         if len(population_status) < 2:
             return population_status
-            
-        # Sort by fitness descending
-        sorted_pop = sorted(population_status, key=lambda x: x.get("sharpe_ratio", 0.0) * x.get("equity", 10.0), reverse=True)
+
+        def _fitness(x: Dict[str, Any]) -> float:
+            """Sortino ratio fitness with trade-count guard."""
+            ticks = x.get("ticks_active", 0)
+            if ticks < 50:
+                return -999.0  # Insufficient trading history — ineligible for top-performer selection
+            sortino = x.get("sortino_ratio", x.get("rolling_sortino", 0.0))
+            return float(sortino)
+
+        # Sort by Sortino descending
+        sorted_pop = sorted(population_status, key=_fitness, reverse=True)
         
         cutoff_count = max(1, int(len(sorted_pop) * self.exploit_fraction))
         top_performers = sorted_pop[:cutoff_count]
         bottom_performers = sorted_pop[-cutoff_count:]
         
-        logger.info(f"PBT Engine executing cycle across {len(sorted_pop)} containers. Top cutoff: {cutoff_count}.")
+        logger.info(
+            f"PBT Engine executing cycle across {len(sorted_pop)} containers. "
+            f"Top cutoff: {cutoff_count}. Fitness metric: Sortino ratio (min 50 ticks)."
+        )
         
         for bottom_child in bottom_performers:
             parent = random.choice(top_performers)
@@ -134,14 +148,15 @@ class PopulationBasedTrainingEngine:
             bottom_child["learning_rate"] = old_lr * mutation_factor
             bottom_child["parent_lineage"] = parent["child_id"]
             
-            # Architecture Mutation: if child is stagnating or negative Sharpe, consider swapping model_name
-            child_sharpe = bottom_child.get("sharpe_ratio", 0.0)
+            # Architecture Mutation: if child is stagnating or negative Sortino, consider swapping model_name
+            child_sortino = bottom_child.get("sortino_ratio", bottom_child.get("rolling_sortino", 0.0))
             child_equity = bottom_child.get("equity", 10.0)
             child_tier = bottom_child.get("tier", 2)
             
-            if random.random() < 0.5 or child_sharpe < 0.0 or child_equity < 8.0:
+            if random.random() < 0.5 or child_sortino < 0.0 or child_equity < 8.0:
                 parent_model = parent.get("model_name")
-                if parent_model and parent.get("sharpe_ratio", 0.0) > 1.0:
+                parent_sortino = parent.get("sortino_ratio", parent.get("rolling_sortino", 0.0))
+                if parent_model and parent_sortino > 1.0:
                     # Check if child tier can support parent model
                     card = REGISTRY.get_model_card(parent_model)
                     if card and child_tier <= card.tier_requirement:

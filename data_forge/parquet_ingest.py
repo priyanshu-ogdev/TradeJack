@@ -58,7 +58,7 @@ class ParquetIngestPipeline:
         os.makedirs(self.data_store_dir, exist_ok=True)
 
     def _check_storage_budget(self) -> bool:
-        """Returns True if storage is within budget, logs warning if approaching 95%."""
+        """Returns True if storage is within budget. If >=95%, calls StorageManager.evict_lru() (BUG-18 FIX)."""
         budget_bytes = config.storage_budget_tb * (1024 ** 4)
         current_bytes = _get_data_store_size_bytes(self.data_store_dir)
         usage_pct = (current_bytes / budget_bytes) * 100 if budget_bytes > 0 else 0
@@ -69,6 +69,13 @@ class ParquetIngestPipeline:
                 f"{config.storage_budget_tb} TB ({usage_pct:.1f}%). "
                 f"Triggering LRU eviction via StorageManager."
             )
+            # BUG-18 FIX: Actually call evict_lru() — was only logged, never executed
+            try:
+                from data_forge.storage_manager import StorageManager
+                StorageManager(self.data_store_dir).evict_lru()
+                logger.info("LRU eviction completed by StorageManager.")
+            except Exception as e:
+                logger.error(f"StorageManager.evict_lru() failed: {e}")
             return False
         elif usage_pct >= 80.0:
             logger.warning(

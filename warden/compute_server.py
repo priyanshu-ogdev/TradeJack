@@ -20,15 +20,31 @@ from warden.warden_core import WardenHypervisor, ContainerLedgerSummary
 from warden.oom_watchdog import RecklessnessWatchdog
 from warden.unified_memory_swap import BlackwellUnifiedAllocator
 
-# SOTA Fix Bug 3: Multiprocessing Isolation for SQLite Audit Loop
-def _audit_worker_process(swarm_size: int, state_dir: str, stop_event: multiprocessing.Event):
+# Segment 5.1 (BUG-3 FIX): Hybrid audit cadence — triggers on whichever comes first:
+# 5s wall-clock OR 500 new ticks received.
+# Flat time.sleep(5.0) allowed fast markets to breach risk limits undetected.
+def _audit_worker_process(swarm_size: int, state_dir: str, stop_event: multiprocessing.Event,
+                           tick_counter: "multiprocessing.Value" = None):
     warden = WardenHypervisor(swarm_size=swarm_size, state_dir=state_dir)
+    TICK_THRESHOLD = 500
+    MAX_WALL_SECONDS = 5.0
+    POLL_INTERVAL = 0.1  # check tick counter every 100ms
+
     while not stop_event.is_set():
         try:
+            t_start = time.time()
+            # Wait until 5s elapsed OR 500 ticks received
+            while not stop_event.is_set():
+                elapsed = time.time() - t_start
+                ticks = tick_counter.value if tick_counter is not None else 0
+                if elapsed >= MAX_WALL_SECONDS or ticks >= TICK_THRESHOLD:
+                    if tick_counter is not None:
+                        tick_counter.value = 0  # reset tick counter after audit
+                    break
+                time.sleep(POLL_INTERVAL)
             warden.run_audit_cycle()
         except Exception as e:
             logger.error(f"Audit cycle failed: {e}")
-        time.sleep(5.0)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] (ComputeServer) %(message)s")
 logger = logging.getLogger("ComputeServer")
@@ -134,6 +150,13 @@ class WardenAPIHandler(BaseHTTPRequestHandler):
         elif parsed_path.path == "/run_audit":
             tier_map = self.warden.run_audit_cycle()
             self._send_json_response(200, {"status": "SUCCESS", "tier_map": tier_map})
+        elif parsed_path.path == "/tick_batch":
+            # Segment 5.1: Child agents POST tick counts so audit can fire after 500 ticks
+            n_ticks = int(body.get("tick_count", 1))
+            if hasattr(self.__class__, 'tick_counter') and self.__class__.tick_counter is not None:
+                with self.__class__.tick_counter.get_lock():
+                    self.__class__.tick_counter.value += n_ticks
+            self._send_json_response(200, {"status": "OK", "ticks_received": n_ticks})
         else:
             self._send_json_response(404, {"error": "Endpoint not found"})
 
@@ -156,15 +179,18 @@ class WardenComputeServer:
         self.warden = WardenHypervisor(swarm_size=swarm_size, state_dir=state_dir)
         self.watchdog = RecklessnessWatchdog(state_dir=state_dir)
         self.unified_allocator = BlackwellUnifiedAllocator(vram_quota_gb=20.0)
+        # Segment 5.1: Shared tick counter for hybrid audit cadence
+        self._tick_counter = multiprocessing.Value('i', 0)
         
         WardenAPIHandler.warden = self.warden
         WardenAPIHandler.watchdog = self.watchdog
         WardenAPIHandler.unified_allocator = self.unified_allocator
+        WardenAPIHandler.tick_counter = self._tick_counter
         self.server = HTTPServer(("0.0.0.0", self.port), WardenAPIHandler)
         self._stop_event = multiprocessing.Event()
         self._audit_process = multiprocessing.Process(
             target=_audit_worker_process, 
-            args=(swarm_size, state_dir, self._stop_event), 
+            args=(swarm_size, state_dir, self._stop_event, self._tick_counter), 
             daemon=True
         )
 

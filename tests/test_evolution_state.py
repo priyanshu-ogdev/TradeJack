@@ -90,7 +90,9 @@ class TestEvolutionAndRollback(unittest.TestCase):
         dqn = DeepQLearningTemplate(input_dim=8, hidden_dim=16)
         
         # Test forward pass with numpy/simulation data
-        sample_seq = np.random.normal(0, 1, (8, 20)).astype(np.float32)
+        # BUG-15 FIX: numpy arrays now converted to tensors in _to_tensor() before .dim() call
+        # Shape: (seq_len=20, input_dim=8) -- models were built with input_dim=8
+        sample_seq = np.random.normal(0, 1, (20, 8)).astype(np.float32)
         out_t = transformer.forward(sample_seq)
         out_c = cnn.forward(sample_seq)
         out_q = dqn.forward(sample_seq)

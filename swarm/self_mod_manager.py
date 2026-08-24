@@ -18,9 +18,6 @@ import subprocess
 import shutil
 import importlib.util
 import gc
-import subprocess
-import shutil
-import importlib.util
 from typing import Dict, Any, List, Optional, Tuple
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] (SelfModEngine) %(message)s")

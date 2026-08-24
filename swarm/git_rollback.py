@@ -98,16 +98,17 @@ class GitFinancialRollback:
                 import shutil
                 shutil.copy2(backup_weights, active_weights_path)
                 logger.info(f"Successfully restored weights file {active_weights_path} from HWM backup {backup_weights}.")
-                
-            # Attempt git checkout of state folder from tag
-            try:
-                subprocess.run(
-                    ["git", "checkout", self.latest_tag_name, "--", f"state/child_{self.child_id}"],
-                    cwd=self.repo_dir, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False
+            else:
+                logger.warning(
+                    f"[ROLLBACK] Backup weights not found at {backup_weights}. "
+                    f"Weights NOT restored — ledger preserved (monotonic max_drawdown intact)."
                 )
-            except Exception:
-                pass
-                
+
+            # NOTE (BUG-1 FIX): We intentionally do NOT run `git checkout tag -- state/child_{id}`.
+            # That command would overwrite ledger.sqlite, erasing max_drawdown and tax_assessments history.
+            # max_drawdown is monotonic: a child that draws down, rolls back, and draws down again
+            # must carry the full risk history. Only the weight checkpoint is restored.
+
             # Reset HWM tracking after rollback
             self.hwm_equity = self.last_tagged_equity
             return True

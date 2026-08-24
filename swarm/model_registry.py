@@ -31,6 +31,18 @@ except ImportError:
     logger.warning("PyTorch not installed; ModelRegistry operating in Laptop Simulation Mode (CPU / Numpy fallback).")
 
 
+def _to_tensor(x: Any) -> Any:
+    """
+    BUG-15 FIX: Universal numpy → torch.Tensor conversion for forward() entry points.
+    Calling x.dim() on a numpy.ndarray raises AttributeError since numpy arrays
+    use x.ndim, not x.dim(). This guard converts any numpy input to float32 tensor
+    before torch operations, preserving the numpy fallback path when TORCH_AVAILABLE=False.
+    """
+    if TORCH_AVAILABLE and isinstance(x, np.ndarray):
+        return torch.from_numpy(x).to(torch.float32)
+    return x
+
+
 @dataclass
 class ModelCard:
     """
@@ -86,6 +98,7 @@ class AttentionIsAllYouNeedModel:
             self.weights = {"encoder": np.random.normal(0, 0.05, (input_dim, d_model)).astype(np.float32), "decoder": np.random.normal(0, 0.05, (d_model, 1)).astype(np.float32)}
 
     def forward(self, x: Any) -> Any:
+        x = _to_tensor(x)  # BUG-15 FIX: convert numpy array before calling .dim()
         if TORCH_AVAILABLE and hasattr(self, "input_proj"):
             if x.dim() == 2: x = x.unsqueeze(0)
             seq_len = x.size(1)
@@ -93,7 +106,7 @@ class AttentionIsAllYouNeedModel:
             h = self.pos_encoder(self.input_proj(x))
             out = self.transformer(h, mask=mask)
             return self.output_proj(out)
-        return np.sum(x, axis=-1, keepdims=True) * 0.01
+        return np.sum(x if isinstance(x, np.ndarray) else x.numpy(), axis=-1, keepdims=True) * 0.01
 
 
 class LSTMSeq2SeqVAEModel:
@@ -113,6 +126,7 @@ class LSTMSeq2SeqVAEModel:
             self.weights = {"vae": np.random.normal(0, 0.05, (input_dim, 1)).astype(np.float32)}
 
     def forward(self, x: Any) -> Any:
+        x = _to_tensor(x)  # BUG-15 FIX: convert numpy array before calling .dim()
         if TORCH_AVAILABLE and hasattr(self, "encoder_lstm"):
             if x.dim() == 2: x = x.unsqueeze(0)
             _, (h_n, _) = self.encoder_lstm(x)
@@ -126,7 +140,7 @@ class LSTMSeq2SeqVAEModel:
             dec_init = torch.relu(self.fc_latent_to_dec(z)).unsqueeze(0)
             dec_out, _ = self.decoder_lstm(x, (dec_init, torch.zeros_like(dec_init)))
             return self.output_head(dec_out[:, -1, :])
-        return np.sum(x, axis=-1, keepdims=True) * 0.012
+        return np.sum(x if isinstance(x, np.ndarray) else x.numpy(), axis=-1, keepdims=True) * 0.012
 
 
 class GRUSeq2SeqVAEModel:
@@ -146,6 +160,7 @@ class GRUSeq2SeqVAEModel:
             self.weights = {"vae": np.random.normal(0, 0.05, (input_dim, 1)).astype(np.float32)}
 
     def forward(self, x: Any) -> Any:
+        x = _to_tensor(x)  # BUG-15 FIX
         if TORCH_AVAILABLE and hasattr(self, "encoder_gru"):
             if x.dim() == 2: x = x.unsqueeze(0)
             _, h_n = self.encoder_gru(x)
@@ -157,7 +172,7 @@ class GRUSeq2SeqVAEModel:
             dec_init = torch.relu(self.fc_latent_to_dec(z)).unsqueeze(0)
             dec_out, _ = self.decoder_gru(x, dec_init)
             return self.output_head(dec_out[:, -1, :])
-        return np.sum(x, axis=-1, keepdims=True) * 0.011
+        return np.sum(x if isinstance(x, np.ndarray) else x.numpy(), axis=-1, keepdims=True) * 0.011
 
 
 class StackingEncoderEnsembleModel:
@@ -175,6 +190,7 @@ class StackingEncoderEnsembleModel:
             self.weights = {"ens": np.random.normal(0, 0.05, (input_dim, 1)).astype(np.float32)}
 
     def forward(self, x: Any) -> Any:
+        x = _to_tensor(x)  # BUG-15 FIX
         if TORCH_AVAILABLE and hasattr(self, "ae_enc"):
             if x.dim() == 2: x = x.unsqueeze(0)
             ae_feat = self.ae_enc(x[:, -1, :])
@@ -183,7 +199,7 @@ class StackingEncoderEnsembleModel:
             lstm_feat = lstm_h[-1]
             combined = torch.cat([ae_feat, conv_feat, lstm_feat], dim=1)
             return self.ensemble_head(combined)
-        return np.sum(x, axis=-1, keepdims=True) * 0.015
+        return np.sum(x if isinstance(x, np.ndarray) else x.numpy(), axis=-1, keepdims=True) * 0.015
 
 
 class StackRNNARIMAXGBModel:
@@ -200,6 +216,7 @@ class StackRNNARIMAXGBModel:
             self.weights = {"hybrid": np.random.normal(0, 0.05, (input_dim, 1)).astype(np.float32)}
 
     def forward(self, x: Any) -> Any:
+        x = _to_tensor(x)  # BUG-15 FIX
         if TORCH_AVAILABLE and hasattr(self, "rnn"):
             if x.dim() == 2: x = x.unsqueeze(0)
             _, h_n = self.rnn(x)
@@ -227,6 +244,7 @@ class DilatedCNNSeq2SeqModel:
             self.weights = {"conv": np.random.normal(0, 0.05, (input_dim, channels)).astype(np.float32)}
 
     def forward(self, x: Any) -> Any:
+        x = _to_tensor(x)  # BUG-15 FIX
         if TORCH_AVAILABLE and hasattr(self, "conv_blocks"):
             if x.dim() == 3: x = x.transpose(1, 2)
             elif x.dim() == 2: x = x.unsqueeze(0).transpose(1, 2)
@@ -254,6 +272,7 @@ class CNNSeq2SeqModel:
             self.weights = {"cnn": np.random.normal(0, 0.05, (input_dim, 1)).astype(np.float32)}
 
     def forward(self, x: Any) -> Any:
+        x = _to_tensor(x)  # BUG-15 FIX
         if TORCH_AVAILABLE and hasattr(self, "conv1"):
             if x.dim() == 3: x = x.transpose(1, 2)
             elif x.dim() == 2: x = x.unsqueeze(0).transpose(1, 2)
@@ -276,6 +295,7 @@ class LSTMSeq2SeqModel:
             self.weights = {"lstm": np.random.normal(0, 0.05, (input_dim, 1)).astype(np.float32)}
 
     def forward(self, x: Any) -> Any:
+        x = _to_tensor(x)  # BUG-15 FIX
         if TORCH_AVAILABLE and hasattr(self, "lstm"):
             if x.dim() == 2: x = x.unsqueeze(0)
             out, _ = self.lstm(x)
@@ -296,6 +316,7 @@ class BiLSTMSeq2SeqModel:
             self.weights = {"bilstm": np.random.normal(0, 0.05, (input_dim, 1)).astype(np.float32)}
 
     def forward(self, x: Any) -> Any:
+        x = _to_tensor(x)  # BUG-15 FIX
         if TORCH_AVAILABLE and hasattr(self, "lstm"):
             if x.dim() == 2: x = x.unsqueeze(0)
             out, _ = self.lstm(x)
@@ -316,6 +337,7 @@ class GRUSeq2SeqModel:
             self.weights = {"gru": np.random.normal(0, 0.05, (input_dim, 1)).astype(np.float32)}
 
     def forward(self, x: Any) -> Any:
+        x = _to_tensor(x)  # BUG-15 FIX
         if TORCH_AVAILABLE and hasattr(self, "gru"):
             if x.dim() == 2: x = x.unsqueeze(0)
             out, _ = self.gru(x)
@@ -336,6 +358,7 @@ class VanillaSeq2SeqModel:
             self.weights = {"rnn": np.random.normal(0, 0.05, (input_dim, 1)).astype(np.float32)}
 
     def forward(self, x: Any) -> Any:
+        x = _to_tensor(x)  # BUG-15 FIX
         if TORCH_AVAILABLE and hasattr(self, "rnn"):
             if x.dim() == 2: x = x.unsqueeze(0)
             out, _ = self.rnn(x)
@@ -357,6 +380,7 @@ class ActorCriticAgentModel:
             self.weights = {"actor": np.random.normal(0, 0.05, (input_dim, 3)).astype(np.float32)}
 
     def forward(self, x: Any) -> Any:
+        x = _to_tensor(x)  # BUG-15 FIX
         if TORCH_AVAILABLE and hasattr(self, "fc_shared"):
             if x.dim() == 3: x = torch.mean(x, dim=1)
             elif x.dim() == 1: x = x.unsqueeze(0)
@@ -382,6 +406,7 @@ class ActorCriticDuelAgentModel:
             self.weights = {"duel": np.random.normal(0, 0.05, (input_dim, 3)).astype(np.float32)}
 
     def forward(self, x: Any) -> Any:
+        x = _to_tensor(x)  # BUG-15 FIX
         if TORCH_AVAILABLE and hasattr(self, "fc_feat"):
             if x.dim() == 3: x = torch.mean(x, dim=1)
             elif x.dim() == 1: x = x.unsqueeze(0)
@@ -406,6 +431,7 @@ class ActorCriticRecurrentAgentModel:
             self.weights = {"rec_ac": np.random.normal(0, 0.05, (input_dim, 3)).astype(np.float32)}
 
     def forward(self, x: Any) -> Any:
+        x = _to_tensor(x)  # BUG-15 FIX
         if TORCH_AVAILABLE and hasattr(self, "lstm"):
             if x.dim() == 2: x = x.unsqueeze(0)
             _, (h_n, _) = self.lstm(x)
@@ -428,6 +454,7 @@ class DoubleDuelRecurrentQAgentModel:
             self.weights = {"ddrq": np.random.normal(0, 0.05, (input_dim, 3)).astype(np.float32)}
 
     def forward(self, x: Any) -> Any:
+        x = _to_tensor(x)  # BUG-15 FIX
         if TORCH_AVAILABLE and hasattr(self, "gru"):
             if x.dim() == 2: x = x.unsqueeze(0)
             _, h_n = self.gru(x)
@@ -457,6 +484,7 @@ class DeepQLearningModel:
             }
 
     def forward(self, x: Any) -> Any:
+        x = _to_tensor(x)  # BUG-15 FIX
         if TORCH_AVAILABLE and hasattr(self, "fc_feat"):
             if x.dim() == 3: x = torch.mean(x, dim=1)
             elif x.dim() == 1: x = x.unsqueeze(0)
@@ -486,6 +514,7 @@ class DoubleQLearningModel:
             self.weights = {"dq": np.random.normal(0, 0.05, (input_dim, 3)).astype(np.float32)}
 
     def forward(self, x: Any) -> Any:
+        x = _to_tensor(x)  # BUG-15 FIX
         if TORCH_AVAILABLE and isinstance(self.net, nn.Module):
             if x.dim() == 3: x = torch.mean(x, dim=1)
             elif x.dim() == 1: x = x.unsqueeze(0)
@@ -506,6 +535,7 @@ class RecurrentQLearningModel:
             self.weights = {"rq": np.random.normal(0, 0.05, (input_dim, 3)).astype(np.float32)}
 
     def forward(self, x: Any) -> Any:
+        x = _to_tensor(x)  # BUG-15 FIX
         if TORCH_AVAILABLE and hasattr(self, "rnn"):
             if x.dim() == 2: x = x.unsqueeze(0)
             _, h_n = self.rnn(x)
@@ -527,6 +557,7 @@ class CuriosityQLearningModel:
             self.weights = {"q": np.random.normal(0, 0.05, (input_dim, 3)).astype(np.float32)}
 
     def forward(self, x: Any) -> Any:
+        x = _to_tensor(x)  # BUG-15 FIX
         if TORCH_AVAILABLE and hasattr(self, "q_net"):
             if x.dim() == 3: x = torch.mean(x, dim=1)
             elif x.dim() == 1: x = x.unsqueeze(0)
@@ -562,6 +593,7 @@ class NeuroEvolutionNESModel:
         self.learning_rate = 0.02
 
     def forward(self, x: Any) -> Any:
+        x = _to_tensor(x)  # BUG-15 FIX
         if TORCH_AVAILABLE and isinstance(x, torch.Tensor):
             x_arr = x.cpu().numpy()
         else:
@@ -597,6 +629,7 @@ class NeuroEvolutionNoveltySearchModel:
         self.behavior_archive: List[float] = []
 
     def forward(self, x: Any) -> Any:
+        x = _to_tensor(x)  # BUG-15 FIX
         if TORCH_AVAILABLE and isinstance(self.net, nn.Module):
             if isinstance(x, np.ndarray): x = torch.from_numpy(x).to(torch.float32)
             if x.dim() == 3: x = torch.mean(x, dim=1)
@@ -623,6 +656,7 @@ class MovingAverageMomentumModel:
         self.long_window = long_window
 
     def forward(self, x: Any) -> Any:
+        x = _to_tensor(x)  # BUG-15 FIX
         if TORCH_AVAILABLE and isinstance(x, torch.Tensor):
             x_arr = x.cpu().numpy()
         else:
@@ -648,6 +682,7 @@ class PolicyGradientAgentModel:
             self.weights = {"pg": np.random.normal(0, 0.05, (input_dim, 3)).astype(np.float32)}
 
     def forward(self, x: Any) -> Any:
+        x = _to_tensor(x)  # BUG-15 FIX
         if TORCH_AVAILABLE and isinstance(self.net, nn.Module):
             if x.dim() == 3: x = torch.mean(x, dim=1)
             elif x.dim() == 1: x = x.unsqueeze(0)
@@ -669,6 +704,7 @@ class DoubleDuelQLearningModel:
             self.weights = {"ddq": np.random.normal(0, 0.05, (input_dim, 3)).astype(np.float32)}
 
     def forward(self, x: Any) -> Any:
+        x = _to_tensor(x)  # BUG-15 FIX
         if TORCH_AVAILABLE and hasattr(self, "fc_feat"):
             if x.dim() == 3: x = torch.mean(x, dim=1)
             elif x.dim() == 1: x = x.unsqueeze(0)
@@ -692,6 +728,7 @@ class ActorCriticDuelRecurrentAgentModel:
             self.weights = {"acdr": np.random.normal(0, 0.05, (input_dim, 3)).astype(np.float32)}
 
     def forward(self, x: Any) -> Any:
+        x = _to_tensor(x)  # BUG-15 FIX
         if TORCH_AVAILABLE and hasattr(self, "rnn"):
             if x.dim() == 2: x = x.unsqueeze(0)
             _, h_n = self.rnn(x)
@@ -715,6 +752,7 @@ class RecurrentCuriosityQLearningModel:
             self.weights = {"rcq": np.random.normal(0, 0.05, (input_dim, 3)).astype(np.float32)}
 
     def forward(self, x: Any) -> Any:
+        x = _to_tensor(x)  # BUG-15 FIX
         if TORCH_AVAILABLE and hasattr(self, "rnn"):
             if x.dim() == 2: x = x.unsqueeze(0)
             _, h_n = self.rnn(x)

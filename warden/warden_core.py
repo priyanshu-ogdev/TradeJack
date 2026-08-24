@@ -14,7 +14,7 @@ import logging
 import subprocess
 import json
 from dataclasses import dataclass
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
 logging.basicConfig(
     level=logging.INFO,
@@ -296,6 +296,8 @@ class WardenHypervisor:
             logger.warning(f"Child {child_id} ({summary.container_name}) insolvent via Warden Tax.")
             self.terminate_insolvent_child(child_id, reason="INSOLVENCY_TAX_EXHAUSTION")
 
+        return total_tax  # BUG-6 FIX: was missing return, callers received None
+
     def record_tier_transition(self, child_id: int, from_tier: int, to_tier: int, summary: ContainerLedgerSummary, reason: str = ""):
         """Records a formal tier transition into the child SQLite ledger (`tier_transitions`)."""
         db_path = self.get_ledger_path(child_id)
@@ -404,12 +406,59 @@ class WardenHypervisor:
         except Exception as e:
             logger.error(f"Error purging container: {e}")
 
+    def check_circuit_breaker(self, daily_start_equity: float) -> bool:
+        """
+        Segment 5.2 — Circuit Breaker: if cumulative daily swarm loss exceeds -20%,
+        halt all trading and require manual restart. Returns True if breaker tripped.
+        """
+        alive = [s for s in self.summaries.values() if s.is_alive]
+        if not alive:
+            return False
+        current_equity = sum(s.equity for s in alive)
+        if daily_start_equity > 0 and (current_equity - daily_start_equity) / daily_start_equity <= -0.20:
+            logger.critical(
+                f"[CIRCUIT BREAKER TRIPPED] Swarm lost ≥20% daily equity. "
+                f"Start: ${daily_start_equity:.2f} | Current: ${current_equity:.2f}. "
+                f"ALL TRADING HALTED. Manual restart required."
+            )
+            # Write halt sentinel file for child agents to detect
+            halt_path = os.path.join(self.state_dir, "CIRCUIT_BREAKER_HALT")
+            with open(halt_path, "w") as f:
+                f.write(json.dumps({
+                    "tripped_at": time.time(),
+                    "daily_start_equity": daily_start_equity,
+                    "current_equity": current_equity,
+                    "loss_pct": (current_equity - daily_start_equity) / daily_start_equity * 100
+                }))
+            return True
+        return False
+
+    def respawn_child(self, child_id: int, parent_id: int, weights_path: Optional[str] = None):
+        """
+        Segment 2 — Respawn a child slot with inherited weights from a top performer.
+        Initializes a fresh ledger with starting capital and copies parent weights.
+        """
+        logger.info(f"[RESPAWN] Spawning Child {child_id} inheriting from Parent {parent_id}.")
+        self.init_child_ledger(child_id, initial_cash=10.0)
+        if weights_path and os.path.exists(weights_path):
+            import shutil
+            state_dir = os.path.join(self.state_dir, f"child_{child_id}")
+            os.makedirs(state_dir, exist_ok=True)
+            dest_weights = os.path.join(state_dir, "weights_current.pt")
+            try:
+                shutil.copy2(weights_path, dest_weights)
+                logger.info(f"[RESPAWN] Copied parent weights from {weights_path} → {dest_weights}")
+            except Exception as e:
+                logger.warning(f"[RESPAWN] Failed to copy parent weights: {e}")
+
     def run_audit_cycle(self) -> Dict[int, int]:
         self._check_data_pipeline_health()
         tier_map = {}
         active_count = 0
         total_equity = 0.0
-        
+        freed_slots: List[int] = []
+        population_status: List[dict] = []
+
         for child_id in range(self.swarm_size):
             summary = self.audit_child_ledger(child_id)
             if summary and summary.is_alive:
@@ -419,7 +468,41 @@ class WardenHypervisor:
                     tier_map[child_id] = tier
                     active_count += 1
                     total_equity += summary.equity
-                    
+                    # Collect population status for PBT
+                    state_dir = os.path.join(self.state_dir, f"child_{child_id}")
+                    population_status.append({
+                        "child_id": child_id,
+                        "equity": summary.equity,
+                        "sharpe_ratio": summary.lifetime_sharpe,
+                        "sortino_ratio": summary.rolling_sortino,
+                        "ticks_active": summary.ticks_active,
+                        "tier": tier,
+                        "weights_path": os.path.join(state_dir, "weights_current.pt"),
+                    })
+                else:
+                    freed_slots.append(child_id)  # Died during tax
+            else:
+                freed_slots.append(child_id)  # Dead or missing
+
+        # Segment 2 — BUG-5 FIX: Wire PBT to fill freed slots with evolved replacements
+        if population_status and freed_slots:
+            try:
+                from swarm.rl_mechanics import PopulationBasedTrainingEngine
+                pbt = PopulationBasedTrainingEngine(swarm_size=self.swarm_size)
+                evolved = pbt.execute_pbt_step(population_status)
+                # Pick best parent for respawning freed slots
+                top = sorted(evolved, key=lambda x: x.get("sortino_ratio", 0.0), reverse=True)
+                for i, slot_id in enumerate(freed_slots[:len(top)]):
+                    parent = top[i % len(top)]
+                    self.respawn_child(
+                        child_id=slot_id,
+                        parent_id=parent["child_id"],
+                        weights_path=parent.get("weights_path")
+                    )
+                logger.info(f"PBT cycle complete. Respawned {len(freed_slots)} freed slots.")
+            except Exception as e:
+                logger.error(f"PBT step failed: {e}")
+
         logger.info(f"Audit Complete: {active_count}/{self.swarm_size} Active | Total Swarm Equity: ${total_equity:.2f}")
         return tier_map
 

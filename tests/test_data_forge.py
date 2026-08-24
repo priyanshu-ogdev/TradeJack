@@ -9,7 +9,8 @@ import asyncio
 import unittest
 import shutil
 
-from data_forge.kvikio_pipeline import KvikIODataForge
+# BUG-9 FIX: module is 'kvikio_streamer', not 'kvikio_pipeline'
+from data_forge.kvikio_streamer import KvikIODataForge
 from data_forge.parquet_ingest import ParquetIngestPipeline
 from data_forge.dali_loader import create_lob_dataloader
 

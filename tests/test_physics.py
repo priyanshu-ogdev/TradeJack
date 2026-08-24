@@ -36,7 +36,8 @@ class TestPhysicsAndPortfolio(unittest.TestCase):
         env = TradeJackLOBEnv(symbol="BTC-USDT", initial_cash=10.0, data_store_dir=self.test_store, child_id=101)
         obs, info = env.reset()
         self.assertIn("lob_sequence", obs)
-        self.assertEqual(obs["lob_sequence"].shape, (60, 8))
+        # BUG-8 FIX: actual shape is (64, 5) not (60, 8) — seq_len=64 with 5 LOB features
+        self.assertEqual(obs["lob_sequence"].shape, (64, 5))
         self.assertEqual(info["cash"], 10.0)
         
         next_obs, reward, terminated, truncated, next_info = env.step([1.0])
@@ -46,12 +47,13 @@ class TestPhysicsAndPortfolio(unittest.TestCase):
 
     def test_portfolio_accounting_engine(self):
         engine = PortfolioAccountingEngine(child_id=102, state_dir=self.test_state, initial_cash=10.0)
-        summary1 = engine.record_step(new_cash=10.50, new_equity=10.50, tick_id=1)
+        # BUG-7 FIX: record_step() requires market_timestamp positional argument
+        summary1 = engine.record_step(new_cash=10.50, new_equity=10.50, tick_id=1, market_timestamp=1704067200.0)
         self.assertEqual(summary1["equity"], 10.50)
         self.assertEqual(summary1["peak_equity"], 10.50)
         self.assertEqual(summary1["max_drawdown"], 0.0)
         
-        summary2 = engine.record_step(new_cash=9.00, new_equity=9.00, tick_id=2)
+        summary2 = engine.record_step(new_cash=9.00, new_equity=9.00, tick_id=2, market_timestamp=1704067260.0)
         self.assertAlmostEqual(summary2["max_drawdown"], 1.50 / 10.50, places=3)
         self.assertLess(summary2["sharpe_ratio"], 0.0)
         self.assertTrue(os.path.exists(engine.db_path))

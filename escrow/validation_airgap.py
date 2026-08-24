@@ -11,6 +11,7 @@ import sys
 import time
 import math
 import random
+import json
 import logging
 import numpy as np
 from typing import Dict, Any, List, Optional, Tuple
@@ -154,7 +155,8 @@ class ValidationAirgapEngine:
             "passed": passed_airgap,
             "weights_path": weights_path,
             "model_type": model_type,
-            "average_sharpe": avg_sharpe,
+            "avg_sharpe": avg_sharpe,          # used by promote_candidate.py
+            "average_sharpe": avg_sharpe,      # backward compat
             "max_drawdown": max_dd,
             "split_results": {
                 "equities": split_equities,
@@ -162,6 +164,52 @@ class ValidationAirgapEngine:
                 "sharpes": split_sharpes
             }
         }
+
+    def validate_promotion_candidate(
+        self,
+        weights_path: str,
+        model_type: str,
+        min_sharpe_override: float = 1.0,
+        max_drawdown_override: float = 0.15
+    ) -> dict:
+        """
+        Segment 4.3 (BUG-12 FIX): Strict promotion gate for Crucible->Deployment transition.
+        Candidate must clear: Avg Sharpe >= 1.0, Max DD <= 15%.
+        This method is called by scripts/promote_candidate.py before any weight copy.
+        No code path exists to reach deployment without passing this gate.
+
+        Returns dict with 'passed' bool and detailed per-split metrics.
+        """
+        # Temporarily override thresholds for promotion gate
+        original_sharpe = self.min_sharpe
+        original_dd = self.max_drawdown
+        self.min_sharpe = min_sharpe_override
+        self.max_drawdown = max_drawdown_override
+
+        logger.info(
+            f"[PROMOTION GATE] Evaluating {weights_path} ({model_type}). "
+            f"Requirements: Avg Sharpe >= {min_sharpe_override}, Max DD <= {max_drawdown_override*100:.0f}%."
+        )
+
+        try:
+            result = self.evaluate_candidate_weights(weights_path, model_type=model_type)
+        finally:
+            # Always restore original thresholds
+            self.min_sharpe = original_sharpe
+            self.max_drawdown = original_dd
+
+        if result["passed"]:
+            logger.info(
+                f"[PROMOTION GATE PASSED] Child candidate {weights_path} is cleared for deployment. "
+                f"Avg Sharpe: {result['avg_sharpe']:.3f}, Max DD: {result['max_drawdown']*100:.1f}%."
+            )
+        else:
+            logger.warning(
+                f"[PROMOTION GATE BLOCKED] Candidate rejected. "
+                f"Avg Sharpe: {result['avg_sharpe']:.3f} (required >= {min_sharpe_override}), "
+                f"Max DD: {result['max_drawdown']*100:.1f}% (required <= {max_drawdown_override*100:.0f}%)."
+            )
+        return result
 
 
 if __name__ == "__main__":
