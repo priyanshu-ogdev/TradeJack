@@ -6,6 +6,8 @@ Simulates exact execution mechanics over multi-asset historical Parquet / NPZ Om
 3. Omni-Forge Integration: Ingests (64, 5) normalized tensors (`close`, `volume`, `ofi`, `vpin_50`, `kyles_lambda`).
 4. Warden Integration: Tracks and commits portfolio state directly to SQLite ledger via PortfolioAccountingEngine.
 5. Logarithmic Reward Math: Penalizes drawdown (Sortino) while ensuring gradient scale stability.
+
+v3 Upgrade: Full Gymnasium compliance for SB3 integration.
 """
 
 import os
@@ -99,7 +101,8 @@ class TradeJackLOBEnv(BaseEnv):
         initial_cash: float = 10.0,
         seq_len: int = 64,
         data_store_dir: str = "d:/TradeJack/data_store",
-        child_id: int = 0
+        child_id: int = 0,
+        render_mode: str = None,
     ):
         if GYM_AVAILABLE:
             super().__init__()
@@ -109,6 +112,7 @@ class TradeJackLOBEnv(BaseEnv):
         self.initial_cash = initial_cash
         self.seq_len = seq_len
         self.child_id = child_id
+        self.render_mode = render_mode
         
         self.taker_fee_bps = 4.0  # 0.04% exchange fee (4 basis points)
         self.funding_rate_daily = 0.0001 # 0.01% per day synthetic funding bleed
@@ -121,9 +125,10 @@ class TradeJackLOBEnv(BaseEnv):
             # Action space: [-1.0, 1.0] target position fraction
             self.action_space = spaces.Box(low=-1.0, high=1.0, shape=(1,), dtype=np.float32)
             # Obs space: sequence of 5 Trade-Flow features + 4 portfolio state vars
+            # Use finite bounds for SB3 env checker compatibility
             self.observation_space = spaces.Dict({
-                "lob_sequence": spaces.Box(low=-np.inf, high=np.inf, shape=(self.seq_len, 5), dtype=np.float32),
-                "portfolio_state": spaces.Box(low=-np.inf, high=np.inf, shape=(4,), dtype=np.float32)
+                "lob_sequence": spaces.Box(low=-100.0, high=100.0, shape=(self.seq_len, 5), dtype=np.float32),
+                "portfolio_state": spaces.Box(low=-100.0, high=100.0, shape=(4,), dtype=np.float32)
             })
             
         self.reset()

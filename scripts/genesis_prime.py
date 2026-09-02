@@ -221,7 +221,69 @@ class GenesisPrimeLauncher:
 
 
 if __name__ == "__main__":
-    launcher = GenesisPrimeLauncher(workspace_dir="d:/TradeJack", num_containers=10)
-    # Run a 10-container simulation for quick standalone verification
-    report = asyncio.run(launcher.run_genesis(simulate_locally=True, max_steps=20))
-    print("Genesis Prime Report:\n", json.dumps(report, indent=2))
+    import argparse
+
+    parser = argparse.ArgumentParser(description="TradeJack v3 Genesis Prime Launcher")
+    parser.add_argument("--mode", choices=["paper", "testnet", "live", "crucible"], default="crucible",
+                        help="Execution mode: paper (simulated), testnet (Binance testnet), live (real money), crucible (training only)")
+    parser.add_argument("--agents", type=int, default=4, help="Number of agents in tournament (3-10)")
+    parser.add_argument("--max-steps", type=int, default=10000, help="Total timesteps per agent")
+    parser.add_argument("--symbol", type=str, default="BTC-USDT", help="Trading pair")
+    parser.add_argument("--capital", type=float, default=100.0, help="Starting capital (USDT)")
+    parser.add_argument("--legacy", action="store_true", help="Use legacy 50-agent swarm mode (no SB3)")
+    args = parser.parse_args()
+
+    if args.legacy:
+        # Legacy: Run old 50-container simulation
+        launcher = GenesisPrimeLauncher(workspace_dir="d:/TradeJack", num_containers=args.agents)
+        report = asyncio.run(launcher.run_genesis(simulate_locally=True, max_steps=args.max_steps))
+        print("Genesis Prime Report:\n", json.dumps(report, indent=2))
+
+    elif args.mode == "crucible":
+        # v3: Run SB3 training tournament
+        from training.crucible_tournament import CrucibleTournament
+        logger.info(f"Starting Crucible Tournament: {args.agents} agents, {args.max_steps} timesteps")
+        tournament = CrucibleTournament(
+            data_store_dir="d:/TradeJack/data_store",
+            state_dir="d:/TradeJack/state/tournament",
+            symbol=args.symbol,
+        )
+        results = tournament.run_tournament(
+            total_timesteps=args.max_steps,
+            cycle_timesteps=min(5000, args.max_steps // 4),
+        )
+        print("Tournament Results:\n", json.dumps(results, indent=2, default=str))
+
+    elif args.mode in ("paper", "testnet", "live"):
+        # v3: Run inference server with optional continuous training
+        from scripts.deploy_config import DeploymentConfig
+        from execution.live_inference_server import LiveInferenceServer
+        from training.continuous_trainer import ContinuousTrainer
+
+        config = DeploymentConfig(
+            exchange_mode=args.mode,
+            starting_capital=args.capital,
+            model_name="PPO-DilatedCNN",
+        )
+
+        async def run_live():
+            server = LiveInferenceServer.from_config(config)
+
+            # Start continuous trainer in background
+            trainer = ContinuousTrainer(
+                data_store_dir="d:/TradeJack/data_store",
+                inference_server=server,
+            )
+
+            # Run both concurrently
+            inference_task = asyncio.create_task(server.run_forever())
+            training_task = asyncio.create_task(trainer.run_continuous())
+
+            try:
+                await asyncio.gather(inference_task, training_task)
+            except KeyboardInterrupt:
+                logger.info("Shutting down...")
+                server.stop()
+                trainer.stop()
+
+        asyncio.run(run_live())

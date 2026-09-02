@@ -4,6 +4,11 @@ Implements:
 1. Hindsight Experience Replay (HER): Re-labels failed equity trajectories using achieved terminal equity as goals.
 2. Population Based Training (PBT): Exploits top 20% surviving lineage weights and mutates bottom 20% parameters.
 3. Adversarial GAN Spoofer: Injects synthetic order book spoofing patterns during training for resilience against manipulation.
+
+v3 Upgrade:
+  - PBT now operates on SB3 model checkpoints (.zip files from model.save())
+  - Architecture mutation uses v3 model names (PPO-Transformer, SAC-DilatedCNN, DuelingDQN, etc.)
+  - Weight copying includes optimizer state for complete inheritance
 """
 
 import os
@@ -170,15 +175,25 @@ class PopulationBasedTrainingEngine:
                         bottom_child["model_name"] = chosen_card.model_name
                         logger.info(f"[PBT ARCH MUTATION] Child {bottom_child['child_id']} explored new model architecture '{chosen_card.model_name}'.")
 
-            # Copy parent weights file if exists
-            parent_weights = parent.get("weights_path")
-            child_weights = bottom_child.get("weights_path")
-            if parent_weights and child_weights and os.path.exists(parent_weights) and parent_weights != child_weights:
-                try:
-                    import shutil
-                    shutil.copy2(parent_weights, child_weights)
-                except Exception as e:
-                    logger.debug(f"Failed copying parent weights: {e}")
+            # Copy parent SB3 checkpoint if exists
+            # v3: SB3 model.save() produces .zip files containing weights + optimizer state.
+            # We copy the entire checkpoint for complete weight + optimizer inheritance.
+            parent_weights = parent.get("weights_path", parent.get("checkpoint_path"))
+            child_weights = bottom_child.get("weights_path", bottom_child.get("checkpoint_path"))
+            if parent_weights and child_weights and parent_weights != child_weights:
+                # Support both legacy .pt and SB3 .zip checkpoint formats
+                for ext in ["", ".zip", ".pt"]:
+                    src = parent_weights + ext if ext else parent_weights
+                    if os.path.exists(src):
+                        try:
+                            import shutil
+                            dst = child_weights + ext if ext else child_weights
+                            os.makedirs(os.path.dirname(dst), exist_ok=True)
+                            shutil.copy2(src, dst)
+                            logger.info(f"[PBT] Copied checkpoint {src} -> {dst}")
+                        except Exception as e:
+                            logger.debug(f"Failed copying parent checkpoint: {e}")
+                        break
                     
         return sorted_pop
 
@@ -227,7 +242,7 @@ if __name__ == "__main__":
     
     pbt = PopulationBasedTrainingEngine(swarm_size=5, exploit_fraction=0.4)
     status = [
-        {"child_id": 1, "equity": 15.0, "sharpe_ratio": 2.5, "learning_rate": 0.001},
-        {"child_id": 2, "equity": 8.0,  "sharpe_ratio": -0.5, "learning_rate": 0.001}
+        {"child_id": 1, "equity": 15.0, "sortino_ratio": 2.5, "ticks_active": 100, "learning_rate": 0.001, "model_name": "PPO-DilatedCNN"},
+        {"child_id": 2, "equity": 8.0,  "sortino_ratio": -0.5, "ticks_active": 100, "learning_rate": 0.001, "model_name": "DuelingDQN"}
     ]
     print("PBT result:", json.dumps(pbt.execute_pbt_step(status), indent=2))

@@ -32,12 +32,12 @@ except ImportError:
     logger.info("PyTorch not installed; SelfModEngine using Numpy simulation templates.")
 
 from swarm.ewc_optimizer import ElasticWeightConsolidation
-from swarm.model_registry import REGISTRY, ModelCard, PositionalEncoding, AttentionIsAllYouNeedModel, DilatedCNNSeq2SeqModel, DeepQLearningModel
+from swarm.model_registry import REGISTRY, ModelCard
 
-# Backward-compatibility aliases for existing code and tests
-AttentionIsAllYouNeedTemplate = AttentionIsAllYouNeedModel
-DilatedCNNSeq2SeqTemplate = DilatedCNNSeq2SeqModel
-DeepQLearningTemplate = DeepQLearningModel
+# v3: Legacy model class imports removed — the 24 educational toy ports from
+# huseinzol05/Stock-Prediction-Models have been replaced with 5 SB3-backed
+# models. SelfModEngine now manages SB3 algorithm selection, not raw nn.Module
+# architecture swapping.
 
 # ─── IMMUTABLE SAFETY INVARIANTS (Conway Automaton self-mod/code.ts pattern) ───
 PROTECTED_FILES: frozenset = frozenset([
@@ -77,7 +77,7 @@ class SelfModEngine:
     def __init__(self, child_id: int = 0, state_dir: str = "d:/TradeJack/state"):
         self.child_id = child_id
         self.state_dir = os.path.abspath(state_dir)
-        self.active_model: Any = REGISTRY.build_model("Dilated-CNN-Seq2seq")
+        self.active_model: Any = None  # v3: model created via OnlineRLTrainer, not directly from registry
         self.ewc_instance: Optional[ElasticWeightConsolidation] = None
         self.active_tier: int = 2
 
@@ -116,16 +116,21 @@ class SelfModEngine:
 
     def select_optimal_model_for_survival(self, current_tier: int, current_sharpe: float, current_equity: float) -> str:
         """
-        Dynamically selects the optimal model name from `TradeJackModelRegistry` given live survival mode and memory tier.
+        Dynamically selects the optimal SB3-backed model name given survival mode and memory tier.
+
+        v3 model mapping:
+          Tier 1 (20GB): PPO-Transformer (high-capacity, long-horizon)
+          Tier 2 (4GB):  PPO-DilatedCNN or SAC-DilatedCNN
+          Tier 3 (CPU):  DuelingDQN (lightweight, fast iteration)
         """
         if current_tier == 3 or current_equity < 5.00:
-            return "Deep-Q-learning" if current_equity < 3.00 else "Curiosity-Q-learning-Agent"
+            return "DuelingDQN"
         elif current_tier == 1 and current_sharpe > 2.0 and current_equity >= 20.0:
-            return "Attention-is-all-you-Need"
+            return "PPO-Transformer"
         elif current_tier == 1 and current_sharpe > 1.5:
-            return "LSTM-Seq2Seq-VAE"
+            return "SAC-DilatedCNN"
         else:
-            return "Dilated-CNN-Seq2seq" if current_sharpe >= 0.0 else "Actor-Critic-Duel-Agent"
+            return "PPO-DilatedCNN" if current_sharpe >= 0.0 else "SAC-DilatedCNN"
 
     def swap_active_architecture(
         self,
