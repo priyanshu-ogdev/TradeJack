@@ -111,7 +111,7 @@ class LineageVectorDB:
         return self.insert_lineage_record(
             child_id=metadata.get("child_id", 0),
             generation=metadata.get("generation", 1),
-            model_type=metadata.get("model_type", "Dilated-CNN-Seq2seq"),
+            model_type=metadata.get("model_type", "SAC-DilatedCNN"),
             regime_vector=metadata.get("regime_vector", [0.5, 0.5, 0.0, 0.0, 1.0]),
             sharpe=metadata.get("sharpe_ratio", metadata.get("sharpe", 0.0)),
             state_dict_path=metadata.get("state_dict_path", ""),
@@ -176,7 +176,7 @@ class LineageVectorDB:
 if __name__ == "__main__":
     db = LineageVectorDB()
     db.insert_lineage_record(
-        child_id=1, generation=2, model_type="Attention-is-all-you-Need",
+        child_id=1, generation=2, model_type="PPO-Transformer",
         regime_vector=[0.8, 0.2, -0.5, -0.4, 3.1], sharpe=2.8,
         state_dict_path="/forge/weights/gen2_btc_vacuum.pt",
         regime_description="2024 BTC Liquidity Vacuum & High Volatility Flash Crash"

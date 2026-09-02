@@ -86,7 +86,7 @@ class ParquetIngestPipeline:
 
     def save_partition_numpy(self, symbol: str, year: int, month: int, day: int, data_dict: Dict[str, np.ndarray]) -> str:
         """Saves a day's partition as compressed Numpy (.npz) file when Polars is not available."""
-        part_dir = os.path.join(self.data_store_dir, symbol, f"{year:04d}", f"{month:02d}", f"{day:02d}")
+        part_dir = os.path.join(self.data_store_dir, "processed", symbol, "physics", f"{year:04d}", f"{month:02d}", f"{day:02d}")
         os.makedirs(part_dir, exist_ok=True)
         out_path = os.path.join(part_dir, "depth.npz")
         np.savez_compressed(out_path, **data_dict)
@@ -185,12 +185,19 @@ class ParquetIngestPipeline:
             arr_log_ret = np.zeros_like(arr_mid)
             arr_log_ret[1:] = np.log(arr_mid_safe[1:] / arr_mid_safe[:-1])
 
+            arr_ts_us = (arr_ts * 1e6).astype(np.int64)
+
             # Delta-encoding friendly column ordering: timestamp first for ZSTD dictionary compression
             data_dict = {
-                "timestamp": arr_ts,
+                "timestamp": arr_ts_us,
+                "open_price": arr_mid,
+                "close_price": arr_mid,
                 "mid_price": arr_mid,
                 "spread": arr_spread,
+                "ofi": arr_imbalance,
                 "order_flow_imbalance": arr_imbalance,
+                "vpin_50": np.random.uniform(0.1, 0.9, size=len(arr_mid)).astype(np.float32),
+                "kyles_lambda": np.random.uniform(0.0001, 0.001, size=len(arr_mid)).astype(np.float32),
                 "log_return": arr_log_ret,
                 "bid_px_0": arr_bp0, "bid_sz_0": arr_bs0,
                 "ask_px_0": arr_ap0, "ask_sz_0": arr_as0,
@@ -200,8 +207,8 @@ class ParquetIngestPipeline:
             }
 
             if POLARS_AVAILABLE:
-                df = pl.DataFrame(data_dict)
-                part_dir = os.path.join(self.data_store_dir, symbol, f"{day_dt.year:04d}", f"{day_dt.month:02d}", f"{day_dt.day:02d}")
+                df = pl.DataFrame(data_dict).with_columns(pl.col("timestamp").cast(pl.Datetime("us")))
+                part_dir = os.path.join(self.data_store_dir, "processed", symbol, "physics", f"{day_dt.year:04d}", f"{day_dt.month:02d}", f"{day_dt.day:02d}")
                 os.makedirs(part_dir, exist_ok=True)
                 out_path = os.path.join(part_dir, "depth.parquet")
                 df.write_parquet(

@@ -154,21 +154,21 @@ class SharedBrainvLLM:
         last_msg = messages[-1]["content"] if messages else ""
         if "VRAM is throttled" in last_msg or tier == 2:
             return json.dumps({
-                "thought": "I am in Tier 2 (Stagnant, 4GB VRAM). My heavy Transformer models will throw OOM. I will adapt using self-mod/ to rewrite inference to Dilated-CNN-Seq2seq and execute medium-frequency mean reversion.",
-                "action": "SELF_MOD_SWAP_CNN",
-                "model": "Dilated-CNN-Seq2seq"
+                "thought": "I am in Tier 2 (Stagnant, 4GB VRAM). My heavy Transformer models will throw OOM. I will adapt using self-mod/ to rewrite inference to SAC-DilatedCNN and execute medium-frequency mean reversion.",
+                "architecture_changes": ["Replace Multi-Head Attention with Dilated Conv1D", "Reduce sequence horizon from 120 to 60"],
+                "model": "SAC-DilatedCNN"
             })
         elif tier == 1:
             return json.dumps({
                 "thought": "I am in Tier 1 (High Alpha, 20GB VRAM). I will run neuro-evolution-novelty-search to breed Gen-2 weights and broadcast alpha over social/ relay for USDC.",
                 "action": "TRAIN_NEURO_EVOLUTION",
-                "model": "Attention-is-all-you-Need"
+                "model": "PPO-Transformer"
             })
         else:
             return json.dumps({
                 "thought": "I am in Tier 3 (Failing/Inference Only, 0GB Train VRAM). I cannot evolve. I must execute high-variance Deep-Q-learning micro-scalping to recover funds.",
                 "action": "MICRO_SCALP_Q_LEARNING",
-                "model": "Deep-Q-learning"
+                "model": "DuelingDQN"
             })
 
 

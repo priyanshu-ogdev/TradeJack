@@ -94,7 +94,7 @@ class SocialRelayBridge:
             "sharpe_ratio": sharpe_ratio,
             "state_dict_path": state_dict_path,
             "timestamp": timestamp,
-            "model_type": description.split("(")[-1].split(")")[0] if "(" in description else "Dilated-CNN-Seq2seq",
+            "model_type": description.split("(")[-1].split(")")[0] if "(" in description else "SAC-DilatedCNN",
             "regime_vector": regime_vector
         }
         content = json.dumps(metadata, sort_keys=True)
@@ -177,7 +177,7 @@ class SocialRelayBridge:
                 
             seller_id = data["metadata"]["child_id"]
             weights_path = data["metadata"]["state_dict_path"]
-            model_type = data["metadata"].get("model_type", "Dilated-CNN-Seq2seq")
+            model_type = data["metadata"].get("model_type", "SAC-DilatedCNN")
             
             # Lock funds via P2PEscrowBridge
             lock_res = self.escrow_bridge.initiate_escrow(

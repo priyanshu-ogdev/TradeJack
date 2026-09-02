@@ -138,7 +138,7 @@ class WardenAPIHandler(BaseHTTPRequestHandler):
                     "status": "THROTTLED",
                     "vram_limit_gb": 4.0,
                     "tier": 2,
-                    "message": "Stagnant ledger. VRAM throttled to 4GB. You MUST use Dilated-CNN-Seq2seq or lightweight models."
+                    "message": "Stagnant ledger. VRAM throttled to 4GB. You MUST use SAC-DilatedCNN or lightweight models."
                 })
             else:
                 self._send_json_response(200, {

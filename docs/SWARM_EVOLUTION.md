@@ -15,19 +15,21 @@ Each container executes `SovereignChild.run_crucible_loop()`, an autonomous, con
 
 ---
 
-## 2. Dynamic Architecture Swapping & Aggressive CUDA Purging (`self_mod_manager.py`)
+## 2. Standardized Architecture Swapping (`stable-baselines3` & `model_registry.py`)
 
-To guarantee strict compliance with the Warden's VRAM tier assignments, `SelfModEngine` manages three distinct neural architectures inside each container:
+To guarantee strict compliance with the Warden's VRAM tier assignments and utilize production-grade reinforcement learning, `model_registry.py` manages three distinct neural architectures inside each container, wrapped natively by `stable-baselines3`:
 
-1. **`Attention-is-all-you-Need` (Transformer / Multi-Head Attention)**:
-   - **VRAM Requirement**: `Tier 1 (20.0 GB)`
-   - **Structure**: Multi-head self-attention layers (`MultiheadAttention`), positional encodings, and dense feed-forward networks designed to capture complex long-horizon temporal dependencies across multi-day LOB windows.
-2. **`Dilated-CNN-Seq2seq` (Temporal Convolutional Network)**:
-   - **VRAM Requirement**: `Tier 2 (4.0 GB)`
-   - **Structure**: Stacked 1D dilated causal convolutions (`Conv1d` with exponential dilation factors $1, 2, 4, 8$) that process sequence buffers (`seq_len=60`) with high computational efficiency and low memory overhead.
-3. **`Deep-Q-learning` (Scalping Policy Network)**:
-   - **VRAM Requirement**: `Tier 3 (0.0 GB / Inference-Only)`
-   - **Structure**: Compact multi-layer perceptron (`Linear` -> `ReLU`) optimized for rapid scalping decisions when VRAM is locked or when a container is recovering from an OOM penalty.
+1. **`PPO-DilatedCNN` (Proximal Policy Optimization)**:
+   - **VRAM Requirement**: `Tier 1 (20.0 GB)` / High compute
+   - **Structure**: On-policy advantage actor-critic. Uses the shared `LOBFeatureEncoder` (dilated causal CNN, features_dim=128) to capture complex long-horizon temporal dependencies across multi-day LOB windows.
+2. **`SAC-DilatedCNN` (Soft Actor-Critic)**:
+   - **VRAM Requirement**: `Tier 2 (4.0 GB)` / Medium compute
+   - **Structure**: Off-policy maximum entropy RL. Uses the same `LOBFeatureEncoder` but relies on the `PrioritizedReplayBuffer` for highly sample-efficient exploration.
+3. **`DuelingDQN` (Deep Q-Network)**:
+   - **VRAM Requirement**: `Tier 3 (1.0 GB / Inference-Optimized)`
+   - **Structure**: Compact off-policy network for discrete value-based scalping decisions when VRAM is locked or when a container is recovering from an OOM penalty.
+
+All architectures share the `LOBFeatureEncoder`/`LOBFeatureExtractor` which collapses LOB sequence variables and parallel portfolio states into a unified latent space.
 
 ### Phase 5 Upgrades: The Ghost Brain & Memory Creep Fixes
 In Phase 5, the `SelfModEngine` received critical hardening to survive 100-day hot-swapping without leaking VRAM:
@@ -60,11 +62,12 @@ Every container tracks its code and weights inside an isolated git repository (`
 
 ---
 
-## 5. Advanced Reinforcement Learning (`rl_mechanics.py`)
+## 5. Advanced Reinforcement Learning Mechanics (`rl_mechanics.py`)
 
-- **Hindsight Experience Replay (`HindsightExperienceReplay`)**: When an order execution fails to achieve its target profit (`achieved_equity != desired_equity`), HER modifies the stored transition replay buffer (`sample_with_her`), re-labeling the desired goal as whatever equity outcome was actually achieved. This turns failed trades into informative learning signals.
-- **Population-Based Training (`PopulationBasedTrainingEngine`)**: At periodic intervals across the swarm, the bottom $20\%$ of containers (`exploit_fraction=0.4`) discard their underperforming weights, copy the exact parameters of the top $20\%$ containers (`EXPLOIT`), and mutate hyperparameters like learning rate and EWC regularization (`EXPLORE`).
-- **Adversarial GAN Spoofing (`AdversarialGANSpoofer`)**: Generates synthetic, adversarial limit order book spoofing patterns (`generate_spoof_pattern`) and injects them during training, ensuring agents learn to detect and ignore fake liquidity imbalances.
+- **Prioritized Experience Replay Buffer (`PrioritizedReplayBuffer`)**: Off-policy algorithms (SAC, DQN) utilize a centralized, disk-persisted buffer that weights transitions by their TD-error magnitude, ensuring the model samples surprising market conditions more frequently.
+- **Hindsight Experience Replay (`sample_with_her`)**: When an order execution fails to achieve its target profit, HER modifies the stored transition replay buffer, re-labeling the desired goal as whatever equity outcome was actually achieved. This turns failed trades into informative learning signals.
+- **Population-Based Training (`PopulationBasedTrainingEngine`)**: At periodic intervals across the swarm, the bottom $20\%$ of containers (`exploit_fraction=0.4`) discard their underperforming SB3 `.zip` checkpoints, copy the exact parameters of the top $20\%$ containers (`EXPLOIT`), and mutate hyperparameters like learning rate (`EXPLORE`).
+- **Adversarial GAN Spoofing (`AdversarialGANSpoofer`)**: Generates synthetic, adversarial limit order book spoofing patterns and injects them into `LOBEnv` during training, ensuring agents learn to detect and ignore fake liquidity imbalances.
 
 ---
 

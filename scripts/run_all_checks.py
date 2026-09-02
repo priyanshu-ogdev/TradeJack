@@ -388,10 +388,10 @@ def check_connections(results):
         result = pbt.execute_pbt_step(status)
         assert len(result) == 2
 
-    check("Registry → Env → SB3 train+predict", check_registry_to_env, results)
-    check("Config → InferenceServer.from_config", check_config_to_inference, results)
-    check("Guardian → PaperExchange → OrderResult", check_guardian_to_exchange, results)
-    check("PBT → Registry model cards", check_pbt_to_registry, results)
+    check("Registry -> Env -> SB3 train+predict", check_registry_to_env, results)
+    check("Config -> InferenceServer.from_config", check_config_to_inference, results)
+    check("Guardian -> PaperExchange -> OrderResult", check_guardian_to_exchange, results)
+    check("PBT -> Registry model cards", check_pbt_to_registry, results)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

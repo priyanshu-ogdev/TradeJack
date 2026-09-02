@@ -1,7 +1,7 @@
 """
 Self-Modification Engine (`SelfModEngine` for `automaton` `self-mod/`).
-Dynamically modifies and swaps model architectures from `Stock-Prediction-Models` (`Attention-is-all-you-Need`,
-`Dilated-CNN-Seq2seq`, `neuro-evolution-novelty-search`, `Deep-Q-learning`) depending on Warden VRAM tier allocation.
+Dynamically modifies and swaps model architectures from stable-baselines3 (PPO-Transformer,
+SAC-DilatedCNN, PPO-DilatedCNN, DuelingDQN) depending on Warden VRAM tier allocation.
 Automatically injects Grace Blackwell FP8 mixed precision (`torch.float8_e4m3fn`) and Elastic Weight Consolidation (EWC).
 """
 
@@ -148,8 +148,8 @@ class SelfModEngine:
         card = REGISTRY.get_model_card(target_model_name)
         if not card:
             logger.warning(f"Model '{target_model_name}' not found in registry. Using fallback.")
-            card = REGISTRY.get_model_card("Deep-Q-learning")
-            target_model_name = "Deep-Q-learning"
+            card = REGISTRY.get_model_card("DuelingDQN")
+            target_model_name = "DuelingDQN"
             
         # Enforce Warden limits: tier_requirement is the minimum memory capability needed (1=20GB, 2=4GB, 3=1GB).
         # If current_tier > card.tier_requirement, the container has less capability than needed!
@@ -160,15 +160,15 @@ class SelfModEngine:
                 # Pick the first/best allowed model for this tier
                 card = allowed_cards[0]
                 target_model_name = card.model_name
-                if current_tier == 3 and target_model_name != "Deep-Q-learning":
-                    card = REGISTRY.get_model_card("Deep-Q-learning")
-                    target_model_name = "Deep-Q-learning"
-                elif current_tier == 2 and target_model_name == "Attention-is-all-you-Need":
-                    card = REGISTRY.get_model_card("Dilated-CNN-Seq2seq")
-                    target_model_name = "Dilated-CNN-Seq2seq"
+                if current_tier == 3 and target_model_name != "DuelingDQN":
+                    card = REGISTRY.get_model_card("DuelingDQN")
+                    target_model_name = "DuelingDQN"
+                elif current_tier == 2 and target_model_name == "PPO-Transformer":
+                    card = REGISTRY.get_model_card("SAC-DilatedCNN")
+                    target_model_name = "SAC-DilatedCNN"
             else:
-                card = REGISTRY.get_model_card("Deep-Q-learning")
-                target_model_name = "Deep-Q-learning"
+                card = REGISTRY.get_model_card("DuelingDQN")
+                target_model_name = "DuelingDQN"
 
         # Compute EWC on outgoing active model before destroying or offloading
         if self.active_model is not None and calibration_loader is not None:
@@ -297,11 +297,11 @@ if __name__ == "__main__":
     print("Initial active model:", engine.active_model.model_name)
     
     # Test tier 2 restriction against transformer
-    engine.swap_active_architecture("Attention-is-all-you-Need", current_tier=2)
+    engine.swap_active_architecture("PPO-Transformer", current_tier=2)
     print("Active model after Tier 2 swap request:", engine.active_model.model_name)
     
     # Test tier 1 allowance
-    engine.swap_active_architecture("Attention-is-all-you-Need", current_tier=1)
+    engine.swap_active_architecture("PPO-Transformer", current_tier=1)
     print("Active model after Tier 1 swap request:", engine.active_model.model_name)
     
     # Test survival model selection

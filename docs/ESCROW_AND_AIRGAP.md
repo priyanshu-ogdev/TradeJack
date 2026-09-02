@@ -29,9 +29,9 @@ Because containers operate as sovereign entities without mutual trust, transacti
 
 To ensure candidate weights perform well across real market volatility rather than simply overfitting to recent historical candles, `ValidationAirgapEngine` sandboxes candidate models inside a strict 10-split historical crucible:
 
-- **Historical Flash-Crash Splits**: Evaluates candidate weights (`weights.pt` / `weights.npz`) across 10 severe historical regime shifts and liquidity crises (`2020-03-12` COVID crash, `2021-05-19` crypto liquidation cascade, etc.).
-- **Strict Performance Cutoffs**: To clear the airgap (`passed = True`), candidate weights must achieve across all splits:
+- **Historical Flash-Crash Splits**: Evaluates candidate weights (standard `stable-baselines3` `.zip` checkpoints) across 10 severe historical regime shifts and liquidity crises (`2020-03-12` COVID crash, `2021-05-19` crypto liquidation cascade, etc.).
+- **Strict Performance Cutoffs**: To clear the airgap (`passed = True`), candidate checkpoints must achieve across all splits:
   - **Average Sharpe Ratio >= `1.0`** (`min_required_sharpe`)
   - **Maximum Drawdown <= `15.0%`** (`max_allowed_drawdown`)
-- **Poisoning Prevention**: Any model architecture or weight tensor that fails either condition is immediately flagged as overfitted or poisoned (`AIRGAP REJECTED`), preventing it from infecting other containers in the swarm.
+- **Poisoning Prevention**: Any model architecture or SB3 zip tensor collection that fails either condition is immediately flagged as overfitted or poisoned (`AIRGAP REJECTED`), preventing it from infecting other containers in the swarm.
 - **Aggressive Sandbox Purging**: Once the validation evaluation completes, the sandbox immediately invokes the Reaper Protocol `gc.collect()` and `torch.cuda.empty_cache()` hooks to prevent the candidate weights from leaking into the VRAM pool.

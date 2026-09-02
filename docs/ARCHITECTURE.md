@@ -23,7 +23,7 @@ The physics layer ensures agents learn in a mathematically pure representation o
 
 ### 3. Sovereign Swarm (The Agents)
 The 50 Child Agents operate as entirely sovereign processes/threads, competing for limited DGX VRAM and survival.
-*   **Self-Modifying Architecture:** Powered by the `SelfModEngine`, agents dynamically swap their own PyTorch neural network architectures (e.g., from `Dilated-CNN-Seq2seq` to `Deep-Q-learning`) if the Warden degrades their VRAM capabilities.
+*   **Standardized RL Backbones (stable-baselines3):** Powered by the new `ContinuousTrainer`, agents dynamically utilize production-grade RL architectures (PPO, SAC, DQN) rather than legacy toy templates. All models share a unified `LOBFeatureEncoder` (a causal dilated CNN) to process micro-structure data.
 *   **Aggressive CUDA Purge:** To prevent "Memory Creep" and VRAM leaks over 100-day epochs, the `SelfModEngine` explicitly unloads active C++ extensions, clears the Python `sys.modules` cache, and executes strict `torch.cuda.empty_cache()` sweeps during hot-swaps.
 *   **Lineage Vector DB (Chroma):** Agents utilize a dedicated ChromaDB to log successful genome traits and adversarial strategies, performing RAG across generations.
 
@@ -46,12 +46,12 @@ The Warden is the system's merciless governor, designed to prevent complacency a
 
 ---
 
-## The Execution Flow (The Crucible Loop)
+## The Execution Flow (The Crucible Loop v3)
 1. **Boot:** `genesis_prime.py` validates DGX hardware, launches the `WardenComputeServer` in a background process, and boots the `SharedBrainvLLM`.
-2. **Ingest:** The Data Forge memory-maps the order books.
-3. **Spawn:** 50 Sovereign Children are launched, each starting with $10.00 and an identical Base RL model.
-4. **Trade & Tax:** Agents execute trades against the Physics Engine. Concurrently, the Warden audits their SQLite ledgers, draining their cash via the Logarithmic Tax.
-5. **Evolve & Degrade:** If an agent's equity drops, the Warden throttles its VRAM (e.g., Tier 2 -> Tier 3). The agent petitions vLLM for a lighter architecture, executes an Aggressive CUDA Purge, and resumes trading with a new neural net.
-6. **Purge:** Agents that hit $0.00 are purged. The cycle continues until the surviving elite scale to $10,000.00 or are destroyed.
+2. **Ingest:** The Data Forge memory-maps the order books, generating synthetic Crucible data if historical partitions are missing.
+3. **Spawn:** The `CrucibleTournament` or `LiveInferenceServer` is launched, orchestrating agents via standard SB3 environments (`TradeJackLOBEnv`).
+4. **Trade & Tax:** Agents execute trades against the Physics Engine (Paper or Live modes). Concurrently, the Warden audits their SQLite ledgers, draining their cash via the Logarithmic Tax and verifying risk constraints via `RiskGuardian`.
+5. **Evolve & Degrade:** If an agent's equity drops, Population-Based Training (`PopulationBasedTrainingEngine`) executes step exploitation. Top performers clone their `.zip` checkpoints to weaker agents.
+6. **Deploy:** Checkpoints that survive the `ValidationAirgapEngine` are promoted to production deployments via `deploy_config.py`.
 
-**Status: Project Complete. Systems Nominal. Deployment Ready.**
+**Status: Project Complete (v3 Upgrade Integrated). Systems Nominal. Deployment Ready.**

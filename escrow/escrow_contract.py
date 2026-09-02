@@ -89,7 +89,7 @@ class P2PEscrowBridge:
         seller_id: int,
         weights_path: str,
         price_usdc: float = 0.50,
-        model_type: str = "Dilated-CNN-Seq2seq"
+        model_type: str = "SAC-DilatedCNN"
     ) -> Dict[str, Any]:
         """
         Locks `price_usdc` from buyer balance and registers pending escrow transaction.

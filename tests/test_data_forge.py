@@ -29,7 +29,7 @@ class TestDataForgeSubsystems(unittest.TestCase):
         ingest = ParquetIngestPipeline(data_store_dir=self.test_data_store)
         asyncio.run(ingest.generate_synthetic_crucible_data(symbol="ETH-USDT", num_days=1, ticks_per_day=50))
         
-        eth_dir = os.path.join(self.test_data_store, "ETH-USDT")
+        eth_dir = os.path.join(self.test_data_store, "processed", "ETH-USDT", "physics")
         self.assertTrue(os.path.exists(eth_dir))
         files = os.listdir(eth_dir)
         self.assertGreater(len(files), 0)
@@ -60,7 +60,7 @@ class TestDataForgeSubsystems(unittest.TestCase):
             self.assertIsNotNone(batch_x)
             self.assertEqual(batch_x.shape[0], 8)
             self.assertEqual(batch_x.shape[1], 10)
-            self.assertEqual(batch_x.shape[2], 8)
+            self.assertEqual(batch_x.shape[2], 6)
             break
 
 

@@ -28,7 +28,7 @@ def parse_args():
         description="TradeJack Promotion CLI - gates Crucible->Deployment with human confirmation"
     )
     parser.add_argument("--weights", required=True, help="Path to candidate weights file (.pt)")
-    parser.add_argument("--model", required=True, help="Model architecture name (e.g. Dilated-CNN-Seq2seq)")
+    parser.add_argument("--model", required=True, help="Model architecture name (e.g. SAC-DilatedCNN)")
     parser.add_argument("--child-id", type=int, required=True, help="Source child ID in the Crucible")
     parser.add_argument("--data-store", default="d:/TradeJack/data_store", help="Path to data store")
     parser.add_argument("--force", action="store_true", help="Skip interactive confirmation (still requires human intent)")

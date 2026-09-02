@@ -65,7 +65,7 @@ class TestEscrowAndAirgap(unittest.TestCase):
 
     def test_airgap_validation_engine_splits(self):
         airgap = ValidationAirgapEngine(num_splits=3, min_required_sharpe=0.0, max_allowed_drawdown=0.5, data_store_dir=self.test_store)
-        report = airgap.evaluate_candidate_weights("dummy.pt", model_type="Dilated-CNN-Seq2seq", symbol="BTC-USDT")
+        report = airgap.evaluate_candidate_weights("dummy.pt", model_type="SAC-DilatedCNN", symbol="BTC-USDT")
         self.assertIn("passed", report)
         self.assertIn("split_results", report)
         self.assertEqual(len(report["split_results"]["equities"]), 3)
