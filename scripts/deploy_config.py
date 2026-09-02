@@ -5,7 +5,7 @@
 from dataclasses import dataclass
 
 
-@dataclass(frozen=True)
+@dataclass
 class DeploymentConfig:
     # ── Capital Settings ──
     # $100 minimum for realistic fee economics (0.2% round-trip < 1% of activity)
@@ -16,7 +16,7 @@ class DeploymentConfig:
     min_hold_ticks: int = 100
 
     # ── Model Settings ──
-    frozen_model_path: str = "state/deployed/weights_promoted.pt"
+    frozen_model_path: str = "state/deployed/weights_promoted.zip"
     model_name: str = "PPO-DilatedCNN"
 
     # ── Exchange Settings ──

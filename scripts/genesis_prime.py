@@ -30,6 +30,12 @@ try:
 except ImportError:
     TORCH_AVAILABLE = False
 
+import os
+import sys
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if ROOT not in sys.path:
+    sys.path.insert(0, ROOT)
+
 from warden.warden_core import WardenHypervisor
 from warden.unified_memory_swap import BlackwellUnifiedAllocator
 from warden.oom_watchdog import RecklessnessWatchdog

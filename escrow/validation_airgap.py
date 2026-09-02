@@ -1,9 +1,14 @@
 """
 10x Rolling Validation Airgap (`ValidationAirgapEngine`).
-Evaluates candidate `state_dict` weights in a completely sandboxed simulation across 10 out-of-sample
+Evaluates candidate model checkpoints in a sandboxed simulation across N out-of-sample
 historical market splits (including simulated liquidity vacuums and high volatility crashes).
-If the candidate model fails (`average_sharpe < 1.0` or `max_drawdown >= 0.15` on any split),
-the weights are classified as poisoned or overfitted and rejected before escrow settlement.
+If the candidate model fails on key metrics, the weights are classified as overfitted and rejected.
+
+v3 Upgrade:
+  - Loads SB3 checkpoints (.zip) via model.load() instead of raw state_dict
+  - Falls back to baseline models for dummy/missing weight paths
+  - Supports both v3 model names (PPO-DilatedCNN, SAC-DilatedCNN, etc.)
+    and legacy names (Dilated-CNN-Seq2seq) for backward compatibility
 """
 
 import os
@@ -25,13 +30,27 @@ try:
 except ImportError:
     TORCH_AVAILABLE = False
 
+try:
+    from stable_baselines3 import PPO, SAC, DQN
+    SB3_AVAILABLE = True
+except ImportError:
+    SB3_AVAILABLE = False
+
 from physics.lob_env import TradeJackLOBEnv
-from swarm.self_mod_manager import SelfModEngine, DilatedCNNSeq2SeqTemplate, AttentionIsAllYouNeedTemplate, DeepQLearningTemplate
+
+# v3 model name mapping (legacy → new)
+LEGACY_MODEL_MAP = {
+    "Dilated-CNN-Seq2seq": "PPO-DilatedCNN",
+    "Attention-is-all-you-Need": "PPO-Transformer",
+    "Deep-Q-learning": "DuelingDQN",
+    "LSTM-Seq2Seq-VAE": "SAC-DilatedCNN",
+    "Actor-Critic-Duel-Agent": "SAC-DilatedCNN",
+}
 
 
 class ValidationAirgapEngine:
     """
-    Sandboxed evaluation chamber running candidate weights across 10 distinct historical stress tests.
+    Sandboxed evaluation chamber running candidate weights across N distinct historical stress tests.
     """
 
     def __init__(
@@ -46,103 +65,115 @@ class ValidationAirgapEngine:
         self.max_drawdown = max_allowed_drawdown
         self.data_store_dir = os.path.abspath(data_store_dir)
 
-    def _load_model_from_weights(self, weights_path: str, model_type: str = "Dilated-CNN-Seq2seq") -> Any:
-        """Instantiates a candidate model and loads parameters from `state_dict_path`."""
-        if model_type == "Attention-is-all-you-Need":
-            model = AttentionIsAllYouNeedTemplate()
-        elif model_type == "Deep-Q-learning":
-            model = DeepQLearningTemplate()
-        else:
-            model = DilatedCNNSeq2SeqTemplate()
-            
-        if TORCH_AVAILABLE and hasattr(model, "net") and os.path.exists(weights_path):
+    def _resolve_model_name(self, model_type: str) -> str:
+        """Map legacy model names to v3 names."""
+        return LEGACY_MODEL_MAP.get(model_type, model_type)
+
+    def _load_model_from_weights(self, weights_path: str, model_type: str = "PPO-DilatedCNN"):
+        """
+        Load a candidate model for evaluation.
+
+        v3: Loads SB3 checkpoint (.zip) via PPO.load() / SAC.load() / DQN.load().
+        Falls back to a random-weight baseline if the checkpoint doesn't exist
+        (which is correct — dummy weights SHOULD fail the airgap).
+        """
+        resolved = self._resolve_model_name(model_type)
+
+        # Determine SB3 algorithm class from model name
+        algo_map = {"PPO": PPO, "SAC": SAC, "DQN": DQN} if SB3_AVAILABLE else {}
+        algo_prefix = resolved.split("-")[0] if "-" in resolved else resolved
+        algo_cls = algo_map.get(algo_prefix)
+
+        # Try loading SB3 checkpoint
+        if SB3_AVAILABLE and algo_cls:
+            for ext in ["", ".zip"]:
+                path = weights_path + ext if ext else weights_path
+                if os.path.exists(path):
+                    try:
+                        model = algo_cls.load(path, device="cpu")
+                        logger.info(f"Loaded SB3 checkpoint: {path} ({resolved})")
+                        return model
+                    except Exception as e:
+                        logger.warning(f"Failed to load SB3 checkpoint ({path}): {e}")
+
+        # Fallback: use a baseline model (random policy or momentum)
+        # This is intentional — a dummy/missing checkpoint SHOULD fail the airgap
+        logger.info(f"No valid checkpoint at '{weights_path}'. Using random baseline for evaluation.")
+        return None  # Signals to use random/flat actions
+
+    def _predict_action(self, model, obs: Dict[str, np.ndarray]) -> float:
+        """Get action from model, handling both SB3 and None (random) models."""
+        if model is None:
+            # Random/flat baseline — should fail airgap
+            return float(np.random.uniform(-0.2, 0.2))
+
+        if SB3_AVAILABLE and hasattr(model, "predict"):
             try:
-                state_dict = torch.load(weights_path, map_location="cpu")
-                if isinstance(state_dict, dict) and "model_state_dict" in state_dict:
-                    model.net.load_state_dict(state_dict["model_state_dict"], strict=False)
-                elif isinstance(state_dict, dict):
-                    model.net.load_state_dict(state_dict, strict=False)
-                logger.debug(f"Loaded PyTorch state_dict from {weights_path}")
-            except Exception as e:
-                logger.warning(f"Could not load PyTorch weights ({e}). Evaluating default parameters.")
-        elif hasattr(model, "weights") and os.path.exists(weights_path):
-            # Check for numpy weights
-            try:
-                if weights_path.endswith(".npz"):
-                    data = np.load(weights_path)
-                    for k in model.weights:
-                        if k in data:
-                            model.weights[k] = data[k]
+                action, _ = model.predict(obs, deterministic=True)
+                if isinstance(action, np.ndarray):
+                    return float(np.clip(action[0], -1.0, 1.0))
+                return float(np.clip(action, -1.0, 1.0))
             except Exception:
-                pass
-                
-        return model
+                return 0.0
+
+        return 0.0
 
     def evaluate_candidate_weights(
         self,
         weights_path: str,
-        model_type: str = "Dilated-CNN-Seq2seq",
+        model_type: str = "PPO-DilatedCNN",
         symbol: str = "BTC-USDT"
     ) -> Dict[str, Any]:
         """
-        Runs the 10x Rolling Validation Airgap. Returns validation status and metrics across splits.
+        Runs the Nx Rolling Validation Airgap. Returns validation status and metrics across splits.
         """
-        logger.info(f"[AIRGAP COMMENCING] Sandboxing weights '{weights_path}' ({model_type}) across {self.num_splits} stress splits...")
-        
+        resolved = self._resolve_model_name(model_type)
+        logger.info(f"[AIRGAP COMMENCING] Sandboxing weights '{weights_path}' ({resolved}) across {self.num_splits} stress splits...")
+
         model = self._load_model_from_weights(weights_path, model_type=model_type)
         split_sharpes: List[float] = []
         split_drawdowns: List[float] = []
         split_equities: List[float] = []
-        
+
         for split_idx in range(self.num_splits):
             # Each split tests a different deterministic random seed and simulated LOB shock profile
             seed = 1000 + split_idx * 17
             random.seed(seed)
             np.random.seed(seed)
-            
+
             env = TradeJackLOBEnv(
                 symbol=symbol,
                 initial_cash=10.0,
                 data_store_dir=self.data_store_dir,
                 child_id=999  # Airgap sandbox id
             )
-            
+
             obs, info = env.reset(seed=seed)
             terminated = False
             truncated = False
-            
+
             # Run up to 100 steps on this split
             for _ in range(100):
-                lob_seq = obs["lob_sequence"]
-                if TORCH_AVAILABLE and hasattr(model, "net"):
-                    t_in = torch.from_numpy(lob_seq).unsqueeze(0).to(torch.float32)
-                    with torch.no_grad():
-                        out = model.forward(t_in)
-                        action = float(out.mean().cpu().numpy()) if isinstance(out, torch.Tensor) else float(np.mean(out))
-                else:
-                    out = model.forward(lob_seq)
-                    action = float(np.mean(out))
-                    
-                action = float(np.clip(action, -1.0, 1.0))
+                action = self._predict_action(model, obs)
                 obs, reward, terminated, truncated, info = env.step([action])
                 if terminated or truncated:
                     break
-                    
+
             # Calculate split metrics
             eq = info["equity"]
             dd = info["max_drawdown"]
             # Approximate split Sharpe from equity change
             ret = (eq - 10.0) / 10.0
             split_sharpe = ret * 10.0 if dd < 0.05 else ret / (dd + 1e-4)
-            
+
             split_equities.append(eq)
             split_drawdowns.append(dd)
             split_sharpes.append(split_sharpe)
-            
+
         avg_sharpe = float(np.mean(split_sharpes))
         max_dd = float(np.max(split_drawdowns))
         passed_airgap = (avg_sharpe >= self.min_sharpe) and (max_dd <= self.max_drawdown)
-        
+
         if passed_airgap:
             logger.info(f"[AIRGAP PASSED] Candidate weights cleared validation. Avg Sharpe: {avg_sharpe:.2f}, Max DD: {max_dd*100:.1f}%.")
         else:
@@ -150,12 +181,12 @@ class ValidationAirgapEngine:
                 f"[AIRGAP REJECTED] Candidate weights failed validation! Avg Sharpe: {avg_sharpe:.2f} (Req >= {self.min_sharpe}), "
                 f"Max DD: {max_dd*100:.1f}% (Req <= {self.max_drawdown*100:.1f}%). Flagged as overfitted/poisoned."
             )
-            
+
         return {
             "passed": passed_airgap,
             "weights_path": weights_path,
-            "model_type": model_type,
-            "avg_sharpe": avg_sharpe,          # used by promote_candidate.py
+            "model_type": resolved,
+            "avg_sharpe": avg_sharpe,
             "average_sharpe": avg_sharpe,      # backward compat
             "max_drawdown": max_dd,
             "split_results": {
@@ -173,34 +204,29 @@ class ValidationAirgapEngine:
         max_drawdown_override: float = 0.15
     ) -> dict:
         """
-        Segment 4.3 (BUG-12 FIX): Strict promotion gate for Crucible->Deployment transition.
+        Strict promotion gate for Crucible->Deployment transition.
         Candidate must clear: Avg Sharpe >= 1.0, Max DD <= 15%.
-        This method is called by scripts/promote_candidate.py before any weight copy.
-        No code path exists to reach deployment without passing this gate.
-
-        Returns dict with 'passed' bool and detailed per-split metrics.
         """
-        # Temporarily override thresholds for promotion gate
+        resolved = self._resolve_model_name(model_type)
         original_sharpe = self.min_sharpe
         original_dd = self.max_drawdown
         self.min_sharpe = min_sharpe_override
         self.max_drawdown = max_drawdown_override
 
         logger.info(
-            f"[PROMOTION GATE] Evaluating {weights_path} ({model_type}). "
+            f"[PROMOTION GATE] Evaluating {weights_path} ({resolved}). "
             f"Requirements: Avg Sharpe >= {min_sharpe_override}, Max DD <= {max_drawdown_override*100:.0f}%."
         )
 
         try:
             result = self.evaluate_candidate_weights(weights_path, model_type=model_type)
         finally:
-            # Always restore original thresholds
             self.min_sharpe = original_sharpe
             self.max_drawdown = original_dd
 
         if result["passed"]:
             logger.info(
-                f"[PROMOTION GATE PASSED] Child candidate {weights_path} is cleared for deployment. "
+                f"[PROMOTION GATE PASSED] Candidate {weights_path} is cleared for deployment. "
                 f"Avg Sharpe: {result['avg_sharpe']:.3f}, Max DD: {result['max_drawdown']*100:.1f}%."
             )
         else:
@@ -214,12 +240,11 @@ class ValidationAirgapEngine:
 
 if __name__ == "__main__":
     logger.info("Testing ValidationAirgapEngine standalone...")
-    # Generate test data if needed
     from data_forge.parquet_ingest import ParquetIngestPipeline
     import asyncio
     ingest = ParquetIngestPipeline(data_store_dir="d:/TradeJack/data_store")
     asyncio.run(ingest.generate_synthetic_crucible_data(symbol="BTC-USDT", num_days=1, ticks_per_day=150))
-    
+
     airgap = ValidationAirgapEngine(num_splits=3, min_required_sharpe=0.0, max_allowed_drawdown=0.5)
-    res = airgap.evaluate_candidate_weights("dummy_weights.pt", model_type="Dilated-CNN-Seq2seq")
+    res = airgap.evaluate_candidate_weights("dummy_weights.pt", model_type="PPO-DilatedCNN")
     print("Airgap Evaluation Summary:", json.dumps(res, indent=2))

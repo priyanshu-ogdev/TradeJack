@@ -1,11 +1,11 @@
-﻿# scripts/promote_candidate.py - Human-Confirmed Promotion CLI
-# Segment 4.3 (BUG-12 FIX): Gates Crucible->Deployment promotion through the airgap.
+# scripts/promote_candidate.py - Human-Confirmed Promotion CLI
+# Gates Crucible->Deployment promotion through the airgap.
 # Requires human confirmation before copying weights. No auto-promotion.
 #
 # Usage:
-#   python scripts/promote_candidate.py --weights state/child_7/weights_v7.pt
-#                                       --model Dilated-CNN-Seq2seq
-#                                       --child-id 7
+#   python scripts/promote_candidate.py --weights state/tournament/agent_0/model.zip
+#                                       --model PPO-DilatedCNN
+#                                       --child-id 0
 #   Optionally: --force to skip confirmation prompt (for CI pipelines with human oversight)
 
 import os
@@ -55,7 +55,9 @@ def run_airgap_validation(weights_path: str, model_type: str, data_store: str) -
 
 def promote(weights_path: str, model_type: str, child_id: int, airgap_result: dict):
     os.makedirs(DEPLOY_WEIGHTS_DIR, exist_ok=True)
-    dest = os.path.join(DEPLOY_WEIGHTS_DIR, "weights_promoted.pt")
+    # Determine file extension for the promoted checkpoint
+    ext = os.path.splitext(weights_path)[1] or ".zip"
+    dest = os.path.join(DEPLOY_WEIGHTS_DIR, f"weights_promoted{ext}")
     shutil.copy2(weights_path, dest)
     logger.info(f"Weights promoted: {weights_path} -> {dest}")
 
