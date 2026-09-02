@@ -1,0 +1,37 @@
+# TradeJack dependency manifest.
+# This file did not exist anywhere in the repo prior to this upgrade — every module
+# was relying on whatever happened to be installed in the dev environment.
+# Pin ranges, not exact versions, so security patches still flow in; re-pin exact
+# versions with `pip freeze` once you have a validated live-paper session running.
+
+# --- Core numerics / ML (used by model_registry, physics, swarm) ---
+numpy>=1.26,<2.0
+pandas>=2.1
+scikit-learn>=1.3
+torch>=2.2
+
+# --- Data & storage (used by data_forge, physics) ---
+polars>=0.20
+pydantic>=2.5
+pydantic-settings>=2.1
+qdrant-client>=1.7
+
+# --- RL environment interface (physics/lob_env.py) ---
+gymnasium>=0.29
+
+# --- Networking (data_forge live/historical ingest, execution/ live feed) ---
+aiohttp>=3.9
+requests>=2.31
+
+# --- Telemetry dashboard (warden/deployment_monitor.py, Phase 4 dashboard) ---
+flask>=3.0
+
+# --- Misc existing usage ---
+huggingface-hub>=0.20
+
+# --- New in this upgrade: execution/ live paper-trading layer ---
+scipy>=1.11          # statistical significance tests (walk-forward evaluator, session_report)
+python-dotenv>=1.0   # load exchange API keys from .env — never commit real keys to the repo
+
+# --- New in this upgrade: RL training engine (swarm/rl_trainer.py, when built) ---
+stable-baselines3>=2.2   # battle-tested PPO/SAC/DQN — do not hand-roll these from scratch

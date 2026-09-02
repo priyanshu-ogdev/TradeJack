@@ -1,233 +1,294 @@
 """
-Paper Exchange — Simulated exchange using LOB physics for paper trading.
+Paper exchange: a synthetic wallet that fills orders against the REAL live order
+book, not a formula and not a third-party demo account.
 
-Same API surface as BinanceSpotAdapter but fills orders using the LOB
-physics engine's slippage model. Tracks a virtual balance. Perfect for
-full pipeline validation before touching testnet/mainnet.
+Why not a third-party simulated account (RoboForex and similar brokers offer
+free "demo" accounts): those introduce a second matching engine and a second
+network hop that behave nothing like the venue you'd actually deploy capital
+to — their fill assumptions, spread, and latency are their product decisions,
+not Binance's. Every gap between "how the demo filled it" and "how the real
+venue would have filled it" is invisible until real money is on the line.
 
-Usage:
-    paper = PaperExchangeAdapter(initial_balance_usdt=100.0)
-    await paper.connect()  # No-op, always succeeds
-    result = await paper.place_market_order("BTC/USDT", "buy", 0.001)
-    balance = await paper.get_balance("USDT")
+What this module does instead: it holds a synthetic cash/position ledger
+(reusing physics.portfolio_tracker.PortfolioAccountingEngine rather than
+reinventing equity/Sharpe/Sortino bookkeeping) and fills orders by walking the
+actual live depth snapshot from binance_live_feed — consuming real visible
+liquidity level by level, computing a real VWAP fill price, and refusing to
+fabricate a fill beyond what the visible book could actually support. Three
+real-world frictions are modeled explicitly:
+
+  1. Latency: a decision made now is not filled now. We sleep out a sampled
+     network+matching latency, THEN read whatever the live book has become by
+     then. Because this runs against a genuinely live, continuously-updating
+     book, that price movement during the latency window is real elapsed
+     market activity, not a statistical slippage add-on.
+  2. Fees: Binance's real taker/maker fee schedule (spot default tier — pass
+     your actual VIP tier if different; do not assume favorable fees).
+  3. Exchange filters: MIN_NOTIONAL / LOT_SIZE-style constraints. The defaults
+     here are illustrative placeholders — fetch the live values from
+     `GET /api/v3/exchangeInfo` for the target symbol before trusting them,
+     they change per-symbol and Binance updates them periodically.
+
+Nothing in this file places a real order. There is no exchange API key here.
 """
 
+import os
+import sys
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 import time
-import logging
+import random
 import asyncio
-from typing import List, Dict, Any, Optional
-
-from execution.exchange_adapter import ExchangeAdapter, OrderResult, OrderBook
+import logging
+import sqlite3
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Tuple
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] (PaperExchange) %(message)s")
 logger = logging.getLogger("PaperExchange")
 
+from physics.portfolio_tracker import PortfolioAccountingEngine
 
-class PaperExchangeAdapter(ExchangeAdapter):
+
+@dataclass
+class ExchangeFilters:
+    """Illustrative defaults — verify against GET /api/v3/exchangeInfo for the
+    real symbol before relying on these for anything but logic testing."""
+    min_notional: float = 10.0
+    step_size: float = 0.00001
+    tick_size: float = 0.01
+
+
+@dataclass
+class FillResult:
+    requested_qty: float
+    filled_qty: float
+    avg_price: float
+    fee_paid: float
+    latency_sec: float
+    levels_consumed: int
+    fully_filled: bool
+    rejected_reason: Optional[str] = None
+
+
+def _walk_book(levels: List[Tuple[float, float]], target_qty: float) -> Tuple[float, float, int]:
     """
-    Simulated exchange for paper trading.
+    Consumes visible depth level-by-level up to target_qty. Returns
+    (avg_price, filled_qty, levels_consumed). Never fills beyond what the
+    visible levels actually contain — if the book doesn't have enough depth,
+    filled_qty < target_qty and the caller must treat this as a partial fill,
+    exactly as a real exchange would report it.
+    """
+    remaining = target_qty
+    notional = 0.0
+    filled = 0.0
+    levels_used = 0
+    for price, size in levels:
+        if remaining <= 1e-12 or price <= 0 or size <= 0:
+            break
+        take = min(remaining, size)
+        notional += take * price
+        filled += take
+        remaining -= take
+        levels_used += 1
+    avg_price = (notional / filled) if filled > 1e-12 else 0.0
+    return avg_price, filled, levels_used
 
-    Uses TradeJackLOBEnv.compute_friction_fill_price() for realistic
-    slippage modeling. No real orders are placed.
 
-    Tracks:
-      - Virtual balances per asset
-      - Simulated order history
-      - Fill prices with Kyle's Lambda slippage
+class PaperExchange:
+    """
+    Synthetic wallet + realistic execution simulator driven by a live (or
+    synthetic-replay, for testing) order book feed.
     """
 
     def __init__(
         self,
-        initial_balance_usdt: float = 100.0,
-        taker_fee_bps: float = 10.0,
-        simulated_kyles_lambda: float = 0.001,
+        symbol: str = "BTC-USDT",
+        initial_cash: float = 10.0,
+        taker_fee_bps: float = 10.0,       # 0.10% — Binance spot default retail taker fee
+        maker_fee_bps: float = 10.0,       # 0.10% — default retail maker fee (no BNB/VIP discount assumed)
+        filters: Optional[ExchangeFilters] = None,
+        latency_mean_sec: float = 0.08,
+        latency_std_sec: float = 0.03,
+        state_dir: str = "state",
+        account_id: int = 900,             # reserved id range for live-paper accounts, distinct from Crucible child_ids
+        depth_levels_visible: int = 20,
     ):
-        self.balances: Dict[str, float] = {"USDT": initial_balance_usdt}
-        self.taker_fee_rate = taker_fee_bps / 10_000.0
-        self.kyles_lambda = simulated_kyles_lambda
-        self._connected = True
-        self.order_history: List[OrderResult] = []
-        self._order_counter = 0
+        self.symbol = symbol
+        self.taker_fee_bps = taker_fee_bps
+        self.maker_fee_bps = maker_fee_bps
+        self.filters = filters or ExchangeFilters()
+        self.latency_mean_sec = latency_mean_sec
+        self.latency_std_sec = latency_std_sec
+        self.depth_levels_visible = depth_levels_visible
+        self.account_id = account_id
 
-        # Simulated price feed (updated on each get_ticker/get_orderbook call)
-        self._current_prices: Dict[str, float] = {
-            "BTC/USDT": 60000.0,
-            "ETH/USDT": 3000.0,
-            "SOL/USDT": 150.0,
-        }
-
-    async def connect(self) -> None:
-        self._connected = True
-        logger.info(f"Paper exchange connected. Balances: {self.balances}")
-
-    async def close(self) -> None:
-        self._connected = False
-        logger.info("Paper exchange closed.")
-
-    def is_connected(self) -> bool:
-        return self._connected
-
-    def set_price(self, symbol: str, price: float):
-        """External price feed injection (e.g., from live WebSocket data)."""
-        self._current_prices[symbol] = price
-
-    async def get_ticker(self, symbol: str) -> float:
-        return self._current_prices.get(symbol, 0.0)
-
-    async def get_orderbook(self, symbol: str, depth: int = 5) -> OrderBook:
-        mid = self._current_prices.get(symbol, 0.0)
-        if mid <= 0:
-            return OrderBook(symbol=symbol, bids=[], asks=[], timestamp=time.time(), mid_price=0.0)
-
-        spread = mid * 0.0001  # 1 bps spread
-        bids = [[mid - spread * (i + 1), 1.0 + i * 0.5] for i in range(depth)]
-        asks = [[mid + spread * (i + 1), 1.0 + i * 0.5] for i in range(depth)]
-
-        return OrderBook(
-            symbol=symbol, bids=bids, asks=asks,
-            timestamp=time.time(), mid_price=mid,
+        self.accounting = PortfolioAccountingEngine(
+            child_id=account_id, state_dir=state_dir, initial_cash=initial_cash
         )
+        self.initial_cash = initial_cash
+        self.position_qty = 0.0
+        self.last_mid_price: Optional[float] = None
+        self._latest_snapshot: Optional[Dict[str, Any]] = None
+        self._latest_snapshot_wall_time = 0.0
 
-    async def get_balance(self, asset: str) -> float:
-        return self.balances.get(asset, 0.0)
+        self.trade_count = 0
+        self.total_fees_paid = 0.0
+        self.total_slippage_cost = 0.0
 
-    async def get_all_balances(self) -> Dict[str, float]:
-        return {k: v for k, v in self.balances.items() if v > 0}
+        self._init_fill_ledger(state_dir, account_id)
 
-    def _compute_fill_price(self, symbol: str, side: str, qty: float) -> float:
-        """
-        Compute fill price with Kyle's Lambda slippage.
-
-        Slippage = lambda * abs(qty)
-        Buy: fill_price = mid + slippage
-        Sell: fill_price = mid - slippage
-        """
-        mid = self._current_prices.get(symbol, 0.0)
-        if mid <= 0:
-            return 0.0
-
-        slippage = self.kyles_lambda * abs(qty)
-        if side == "buy":
-            return mid + slippage * mid  # Proportional slippage
-        else:
-            return mid - slippage * mid
-
-    async def place_market_order(self, symbol: str, side: str, qty: float) -> OrderResult:
-        """
-        Simulate a market order with slippage and fees.
-
-        Updates virtual balances accordingly.
-        """
-        self._order_counter += 1
-        order_id = f"PAPER-{self._order_counter:06d}"
-
-        fill_price = self._compute_fill_price(symbol, side, qty)
-        if fill_price <= 0:
-            return OrderResult(
-                order_id=order_id, symbol=symbol, side=side, qty=0.0,
-                avg_price=0.0, cost=0.0, fee=0.0, timestamp=time.time(),
-                status="rejected", raw={"error": f"No price for {symbol}"},
+    def _init_fill_ledger(self, state_dir: str, account_id: int):
+        db_dir = os.path.join(os.path.abspath(state_dir), f"child_{account_id}")
+        os.makedirs(db_dir, exist_ok=True)
+        self.fill_db_path = os.path.join(db_dir, "fills.sqlite")
+        conn = sqlite3.connect(self.fill_db_path)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS fills (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp REAL, symbol TEXT, side TEXT,
+                requested_qty REAL, filled_qty REAL, avg_price REAL, mid_at_decision REAL,
+                fee_paid REAL, latency_sec REAL, levels_consumed INTEGER,
+                fully_filled INTEGER, rejected_reason TEXT, resulting_cash REAL, resulting_equity REAL
             )
+        """)
+        conn.commit()
+        conn.close()
 
-        notional = qty * fill_price
-        fee = notional * self.taker_fee_rate
+    def _log_fill(self, side: str, result: FillResult, mid_at_decision: float):
+        try:
+            conn = sqlite3.connect(self.fill_db_path, timeout=5)
+            conn.execute(
+                """INSERT INTO fills
+                (timestamp, symbol, side, requested_qty, filled_qty, avg_price, mid_at_decision,
+                 fee_paid, latency_sec, levels_consumed, fully_filled, rejected_reason, resulting_cash, resulting_equity)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    time.time(), self.symbol, side, result.requested_qty, result.filled_qty,
+                    result.avg_price, mid_at_decision, result.fee_paid, result.latency_sec,
+                    result.levels_consumed, int(result.fully_filled), result.rejected_reason,
+                    self.accounting.cash, self.accounting.equity,
+                ),
+            )
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            logger.error(f"Fill ledger write failed: {e}")
 
-        # Parse base/quote from symbol
-        parts = symbol.replace("-", "/").split("/")
-        base = parts[0] if len(parts) >= 2 else symbol
-        quote = parts[1] if len(parts) >= 2 else "USDT"
+    def on_depth_update(self, snap: Dict[str, Any]):
+        """Call this from your feed's on_update callback for every depth snapshot.
+        Keeps the exchange's view of the book current for mark-to-market and fills."""
+        self._latest_snapshot = snap
+        self._latest_snapshot_wall_time = time.time()
+        bid = snap.get("bid_px_0", 0.0)
+        ask = snap.get("ask_px_0", 0.0)
+        if bid > 0 and ask > 0:
+            self.last_mid_price = (bid + ask) / 2.0
+            self._mark_to_market(snap.get("timestamp", time.time()))
 
-        if side == "buy":
-            # Check sufficient quote balance
-            total_cost = notional + fee
-            if self.balances.get(quote, 0.0) < total_cost:
-                return OrderResult(
-                    order_id=order_id, symbol=symbol, side=side, qty=0.0,
-                    avg_price=fill_price, cost=0.0, fee=0.0, timestamp=time.time(),
-                    status="rejected", raw={"error": "Insufficient balance"},
-                )
-            self.balances[quote] = self.balances.get(quote, 0.0) - total_cost
-            self.balances[base] = self.balances.get(base, 0.0) + qty
+    def _mark_to_market(self, market_ts: float):
+        if self.last_mid_price is None:
+            return
+        equity = self.accounting.cash + self.position_qty * self.last_mid_price
+        self.accounting.record_step(self.accounting.cash, equity, self.accounting.ticks_active + 1, market_ts)
 
-        elif side == "sell":
-            # Check sufficient base balance
-            if self.balances.get(base, 0.0) < qty:
-                return OrderResult(
-                    order_id=order_id, symbol=symbol, side=side, qty=0.0,
-                    avg_price=fill_price, cost=0.0, fee=0.0, timestamp=time.time(),
-                    status="rejected", raw={"error": "Insufficient balance"},
-                )
-            self.balances[base] = self.balances.get(base, 0.0) - qty
-            self.balances[quote] = self.balances.get(quote, 0.0) + notional - fee
+    def book_is_stale(self, max_age_sec: float = 2.0) -> bool:
+        return (time.time() - self._latest_snapshot_wall_time) > max_age_sec
 
-        result = OrderResult(
-            order_id=order_id, symbol=symbol, side=side, qty=qty,
-            avg_price=fill_price, cost=notional, fee=fee,
-            timestamp=time.time(), status="filled",
+    async def submit_target_position(self, target_frac: float) -> FillResult:
+        """
+        Core entry point: given a target position as a fraction of equity in
+        [-1, 1], computes the required order, sleeps out a sampled realistic
+        latency against the REAL live book, then fills against whatever the
+        book has become by the time the (simulated) order would have arrived.
+        """
+        if self._latest_snapshot is None or self.last_mid_price is None:
+            return FillResult(0, 0, 0, 0, 0, 0, False, rejected_reason="no_book_data_yet")
+        if self.book_is_stale():
+            return FillResult(0, 0, 0, 0, 0, 0, False, rejected_reason="stale_book")
+
+        mid_at_decision = self.last_mid_price
+        equity = self.accounting.equity
+        target_qty = (target_frac * equity) / mid_at_decision
+        qty_delta = target_qty - self.position_qty
+        side = "buy" if qty_delta > 0 else "sell"
+
+        if abs(qty_delta * mid_at_decision) < self.filters.min_notional:
+            result = FillResult(qty_delta, 0.0, 0.0, 0.0, 0.0, 0, False, rejected_reason="below_min_notional")
+            self._log_fill(side, result, mid_at_decision)
+            return result
+
+        latency = max(0.0, random.gauss(self.latency_mean_sec, self.latency_std_sec))
+        await asyncio.sleep(latency)
+
+        if self._latest_snapshot is None or self.book_is_stale():
+            result = FillResult(qty_delta, 0.0, 0.0, 0.0, latency, 0, False, rejected_reason="feed_disconnected_during_latency")
+            self._log_fill(side, result, mid_at_decision)
+            return result
+
+        snap = self._latest_snapshot
+        levels_key_prefix = "ask" if side == "buy" else "bid"
+        levels = [
+            (snap.get(f"{levels_key_prefix}_px_{i}", 0.0), snap.get(f"{levels_key_prefix}_sz_{i}", 0.0))
+            for i in range(self.depth_levels_visible)
+        ]
+
+        step_qty = round(abs(qty_delta) / self.filters.step_size) * self.filters.step_size
+        avg_price, filled_qty, levels_used = _walk_book(levels, step_qty)
+
+        if filled_qty <= 1e-12:
+            result = FillResult(qty_delta, 0.0, 0.0, 0.0, latency, 0, False, rejected_reason="no_visible_liquidity")
+            self._log_fill(side, result, mid_at_decision)
+            return result
+
+        signed_filled = filled_qty if side == "buy" else -filled_qty
+        notional = filled_qty * avg_price
+        fee = notional * (self.taker_fee_bps / 10000.0)
+
+        new_cash = self.accounting.cash - (signed_filled * avg_price) - fee
+        self.position_qty += signed_filled
+        new_equity = new_cash + self.position_qty * avg_price
+
+        self.accounting.record_step(new_cash, new_equity, self.accounting.ticks_active + 1, snap.get("timestamp", time.time()))
+        self.trade_count += 1
+        self.total_fees_paid += fee
+        self.total_slippage_cost += abs(avg_price - mid_at_decision) * filled_qty
+
+        fully_filled = abs(filled_qty - step_qty) < (self.filters.step_size * 2)
+        result = FillResult(
+            requested_qty=qty_delta, filled_qty=signed_filled, avg_price=avg_price,
+            fee_paid=fee, latency_sec=latency, levels_consumed=levels_used,
+            fully_filled=fully_filled, rejected_reason=None if fully_filled else "insufficient_visible_depth",
         )
-        self.order_history.append(result)
-
-        logger.info(
-            f"[PAPER] {side.upper()} {qty:.6f} {base} @ {fill_price:.2f} "
-            f"(cost={notional:.4f} {quote}, fee={fee:.6f})"
-        )
+        self._log_fill(side, result, mid_at_decision)
         return result
 
-    async def get_open_orders(self, symbol: str) -> List[Dict[str, Any]]:
-        return []  # Paper exchange fills immediately
-
-    async def cancel_all_orders(self, symbol: str) -> int:
-        return 0  # Nothing to cancel
-
-    async def get_position(self, symbol: str) -> Dict[str, float]:
-        parts = symbol.replace("-", "/").split("/")
-        base = parts[0] if len(parts) >= 2 else symbol
-        qty = self.balances.get(base, 0.0)
-        return {"qty": qty, "entry_price": 0.0}
-
-    def get_equity(self, base_symbol: str = "BTC/USDT") -> float:
-        """Total equity in quote currency (USDT)."""
-        total = self.balances.get("USDT", 0.0)
-        for asset, qty in self.balances.items():
-            if asset == "USDT" or qty <= 0:
-                continue
-            sym = f"{asset}/USDT"
-            price = self._current_prices.get(sym, 0.0)
-            total += qty * price
-        return total
-
-    def get_trade_summary(self) -> Dict[str, Any]:
-        """Summary of all paper trades."""
-        buys = [o for o in self.order_history if o.side == "buy" and o.status == "filled"]
-        sells = [o for o in self.order_history if o.side == "sell" and o.status == "filled"]
-        total_fees = sum(o.fee for o in self.order_history if o.status == "filled")
-        return {
-            "total_trades": len(self.order_history),
-            "filled_buys": len(buys),
-            "filled_sells": len(sells),
-            "total_fees": round(total_fees, 6),
-            "final_equity": round(self.get_equity(), 4),
-            "balances": {k: round(v, 8) for k, v in self.balances.items() if v > 0},
-        }
+    def close(self):
+        self.accounting.close()
 
 
 if __name__ == "__main__":
-    async def test_paper():
-        paper = PaperExchangeAdapter(initial_balance_usdt=100.0)
-        await paper.connect()
+    import asyncio
+    from execution.binance_live_feed import SyntheticReplayFeed  # synthetic only, see that module's warning
 
-        logger.info(f"Initial USDT: {await paper.get_balance('USDT')}")
-        logger.info(f"BTC price: {await paper.get_ticker('BTC/USDT')}")
+    print("Smoke-testing PaperExchange fill logic against SyntheticReplayFeed (not real data, logic check only)...")
 
-        # Buy some BTC
-        result = await paper.place_market_order("BTC/USDT", "buy", 0.001)
-        logger.info(f"Buy result: {result.status}, filled={result.qty}")
+    async def _main():
+        exch = PaperExchange(symbol="BTC-USDT", initial_cash=10.0, state_dir="/tmp/tradejack_smoketest_state", account_id=999901)
+        feed = SyntheticReplayFeed(seed=7)
 
-        # Sell it back
-        result = await paper.place_market_order("BTC/USDT", "sell", 0.001)
-        logger.info(f"Sell result: {result.status}, filled={result.qty}")
+        async def _on_update(kind, payload):
+            if kind == "depth":
+                exch.on_depth_update(payload)
 
-        logger.info(f"Trade summary: {paper.get_trade_summary()}")
-        await paper.close()
+        feed_task = asyncio.create_task(feed.run(_on_update, duration_sec=6.0, tick_hz=20.0))
+        await asyncio.sleep(0.5)
+        r1 = await exch.submit_target_position(0.5)
+        print("buy attempt:", r1)
+        await asyncio.sleep(1.0)
+        r2 = await exch.submit_target_position(-0.5)
+        print("sell attempt:", r2)
+        await feed_task
+        print(f"Final equity: {exch.accounting.equity:.4f}  Fees paid: {exch.total_fees_paid:.6f}  Trades: {exch.trade_count}")
+        exch.close()
 
-    asyncio.run(test_paper())
+    asyncio.run(_main())
