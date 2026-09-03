@@ -129,6 +129,25 @@ def build_report(
             (total_fees / abs(report["pnl_abs"]) * 100) if report["pnl_abs"] not in (None, 0) else None
         )
 
+    # Benchmark comparison: Buy-and-Hold on underlying price series
+    prices = [d["mid_price"] for d in decisions if d.get("mid_price") and d["mid_price"] > 0]
+    if len(prices) >= 2:
+        bah_return_pct = ((prices[-1] - prices[0]) / prices[0]) * 100.0
+        report["buy_and_hold_pnl_pct"] = round(bah_return_pct, 4)
+        if report.get("pnl_pct") is not None:
+            report["alpha_over_bah_pct"] = round(report["pnl_pct"] - bah_return_pct, 4)
+
+        bah_returns = [(prices[i] - prices[i - 1]) / prices[i - 1] for i in range(1, len(prices))]
+        if SCIPY_AVAILABLE and len(returns) == len(bah_returns) and len(returns) >= min_trades_for_ratios:
+            diff = np.array(returns) - np.array(bah_returns)
+            if np.any(np.abs(diff) > 1e-12):
+                try:
+                    stat_b, pval_b = scipy_stats.wilcoxon(diff)
+                    report["wilcoxon_stat_vs_bah"] = float(stat_b)
+                    report["wilcoxon_pvalue_vs_bah"] = float(pval_b)
+                except Exception:
+                    pass
+
     arr = np.array(returns) if returns else np.array([])
     has_variance = arr.size > 1 and float(np.std(arr)) > 1e-12
     if SCIPY_AVAILABLE and len(returns) >= min_trades_for_ratios and has_variance:
@@ -136,9 +155,8 @@ def build_report(
         report["wilcoxon_stat_vs_zero_return"] = float(stat)
         report["wilcoxon_pvalue_vs_zero_return"] = float(pvalue)
         report["significance_note"] = (
-            "Tests whether tick returns are distinguishable from zero — NOT a guarantee of "
-            "future performance, and still needs a buy-and-hold benchmark comparison (see "
-            "TODO in this file) once fills include the underlying price series."
+            "Tests whether tick returns are distinguishable from zero (Wilcoxon signed-rank). "
+            f"P-value: {pvalue:.4f}. Alpha over Buy-and-Hold: {report.get('alpha_over_bah_pct', 'N/A')}%"
         )
     elif len(returns) >= min_trades_for_ratios and not has_variance:
         report["significance_note"] = "Returns had zero variance (no trades filled) — nothing to test yet."
@@ -159,6 +177,9 @@ def print_report(report: Dict[str, Any]):
     print(f"Start equity:     ${report['start_equity']:.4f}")
     print(f"End equity:       ${report['end_equity']:.4f}")
     print(f"P&L:              ${report['pnl_abs']:.4f} ({report['pnl_pct']:.3f}%)")
+    if report.get("buy_and_hold_pnl_pct") is not None:
+        print(f"Buy & Hold P&L:   {report['buy_and_hold_pnl_pct']:.3f}%")
+        print(f"Alpha over B&H:   {report.get('alpha_over_bah_pct', 0.0):+.3f}%")
     print(f"Ticks recorded:   {report['n_ticks']}")
     print(f"Fills executed:   {report['n_fills']}")
     print(f"Total fees paid:  ${report['total_fees_paid']:.4f}")

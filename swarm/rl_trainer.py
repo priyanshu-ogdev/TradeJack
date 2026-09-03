@@ -167,8 +167,17 @@ class OnlineRLTrainer:
         # Configure SB3 logging
         if log_dir:
             os.makedirs(log_dir, exist_ok=True)
-            new_logger = configure_sb3_logger(log_dir, ["csv", "tensorboard"])
-            self.model.set_logger(new_logger)
+            formats = ["stdout", "csv"]
+            try:
+                import tensorboard  # noqa: F401
+                formats.append("tensorboard")
+            except ImportError:
+                pass
+            try:
+                new_logger = configure_sb3_logger(log_dir, formats)
+                self.model.set_logger(new_logger)
+            except Exception as e:
+                logger.debug(f"Logger configuration fallback: {e}")
 
         self.total_timesteps_trained = 0
         self.card = REGISTRY.get_model_card(model_name)
@@ -207,6 +216,7 @@ class OnlineRLTrainer:
         # Collect summary
         new_metrics = self.metrics_callback.metrics_history[start_metrics_count:]
         summary = {
+            "timesteps": total_timesteps,
             "timesteps_trained": total_timesteps,
             "total_timesteps": self.total_timesteps_trained,
             "wall_time_sec": round(elapsed, 2),

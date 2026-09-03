@@ -68,6 +68,10 @@ class ModelCard:
     description: str
     default_hyperparams: Dict[str, Any] = field(default_factory=dict)
 
+    @property
+    def algo(self) -> str:
+        return self.algo_class
+
 
 # ─── DISCRETE ACTION WRAPPER ───
 

@@ -79,6 +79,10 @@ class DoubleBufferQueue:
             with self.lock:
                 if self.buffer_queue:
                     return self.buffer_queue.pop(0)
+            if not self.worker_thread.is_alive():
+                with self.lock:
+                    if not self.buffer_queue:
+                        return None
             time.sleep(0.002)
         return None
 
@@ -196,9 +200,23 @@ class TradeJackLOBEnv(BaseEnv):
         if not self.current_batch or col_name not in self.current_batch:
             return 0.0
         tensor = self.current_batch[col_name]
+        n = len(tensor)
+        if n == 0:
+            return 0.0
+        idx = max(0, min(idx, n - 1))
         if TORCH_AVAILABLE and isinstance(tensor, torch.Tensor):
-            return float(tensor[idx].item())
-        return float(tensor[idx])
+            val = tensor[idx].item()
+        else:
+            val = tensor[idx]
+        if hasattr(val, "timestamp"):
+            try:
+                return float(val.timestamp())
+            except Exception:
+                pass
+        try:
+            return float(val)
+        except (TypeError, ValueError):
+            return 0.0
 
     def _get_raw_sequence(self) -> np.ndarray:
         if not self.current_batch:
@@ -369,14 +387,13 @@ class TradeJackLOBEnv(BaseEnv):
         
         # Batch Stream boundary logic (Bug 1 & Bug 3 Fix)
         batch_len = len(self.current_batch.get("close_price", []))
-        if self.current_step_in_batch >= batch_len - self.seq_len:
-            next_b = self.prefetch_queue.get_next_batch(timeout=10.0)
+        threshold = max(1, batch_len - self.seq_len)
+        if self.current_step_in_batch >= threshold:
+            next_b = self.prefetch_queue.get_next_batch(timeout=1.0)
             if next_b:
                 self.current_batch = next_b
                 # Bridge the FIFO smoothly by looking backward from the pre-pended tail
-                self.current_step_in_batch = 100 - self.seq_len + 1
-                if self.current_step_in_batch < 0:
-                    self.current_step_in_batch = 0
+                self.current_step_in_batch = max(0, 100 - self.seq_len + 1)
             else:
                 self.is_done = True
                 truncated = True

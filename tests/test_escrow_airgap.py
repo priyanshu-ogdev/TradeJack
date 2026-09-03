@@ -18,8 +18,10 @@ from data_forge.parquet_ingest import ParquetIngestPipeline
 class TestEscrowAndAirgap(unittest.TestCase):
 
     def setUp(self):
-        self.test_state = os.path.abspath("d:/TradeJack/state_test_escrow")
+        self.test_state = os.path.abspath(f"d:/TradeJack/state_test_escrow_{self._testMethodName}")
         self.test_store = os.path.abspath("d:/TradeJack/data_store_test_escrow")
+        if os.path.exists(self.test_state):
+            shutil.rmtree(self.test_state, ignore_errors=True)
         os.makedirs(self.test_state, exist_ok=True)
         os.makedirs(self.test_store, exist_ok=True)
         

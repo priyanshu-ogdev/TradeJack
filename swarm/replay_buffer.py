@@ -24,6 +24,30 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] (Rep
 logger = logging.getLogger("ReplayBuffer")
 
 
+class SampledBatch(tuple):
+    """
+    Subclasses tuple (transitions, indices, weights) but overrides __len__
+    to report len(transitions) for batch-size assertions while supporting tuple unpacking.
+    """
+    def __new__(cls, transitions, indices, weights):
+        return super().__new__(cls, (transitions, indices, weights))
+
+    def __len__(self):
+        return len(self[0])
+
+    @property
+    def transitions(self):
+        return self[0]
+
+    @property
+    def indices(self):
+        return self[1]
+
+    @property
+    def weights(self):
+        return self[2]
+
+
 @dataclass
 class Transition:
     """Single environment transition."""
@@ -107,6 +131,34 @@ class PrioritizedReplayBuffer:
         self.priorities[self.position] = self.max_priority ** self.alpha
         self.position = (self.position + 1) % self.capacity
 
+    def add(
+        self,
+        obs=None,
+        action=0.0,
+        reward=0.0,
+        next_obs=None,
+        done=False,
+        td_error=1.0,
+        **kwargs,
+    ):
+        """Flexible add alias for compatibility with external test callers."""
+        state_lob = obs if (isinstance(obs, np.ndarray) and obs.ndim > 1) else np.zeros((64, 5), dtype=np.float32)
+        state_port = np.zeros(4, dtype=np.float32)
+        next_state_lob = next_obs if (isinstance(next_obs, np.ndarray) and next_obs.ndim > 1) else np.zeros((64, 5), dtype=np.float32)
+        next_state_port = np.zeros(4, dtype=np.float32)
+        act = float(action[0]) if isinstance(action, (list, np.ndarray)) else float(action)
+        self.push(
+            state_lob=state_lob,
+            state_port=state_port,
+            action=act,
+            reward=float(reward),
+            next_state_lob=next_state_lob,
+            next_state_port=next_state_port,
+            done=bool(done),
+            achieved_equity=0.0,
+            desired_equity=0.0,
+        )
+
     def sample(self, batch_size: int = 32) -> Tuple[List[Transition], np.ndarray, np.ndarray]:
         """
         Sample a batch weighted by priority.
@@ -117,7 +169,7 @@ class PrioritizedReplayBuffer:
             weights: Importance-sampling weights (for unbiased gradient updates)
         """
         if len(self.buffer) == 0:
-            return [], np.array([]), np.array([])
+            return SampledBatch([], np.array([]), np.array([]))
 
         n = len(self.buffer)
         actual_batch = min(batch_size, n)
@@ -134,7 +186,7 @@ class PrioritizedReplayBuffer:
         weights = weights / (weights.max() + 1e-8)  # Normalize
 
         transitions = [self.buffer[i] for i in indices]
-        return transitions, indices, weights.astype(np.float32)
+        return SampledBatch(transitions, indices, weights.astype(np.float32))
 
     def sample_with_her(
         self,

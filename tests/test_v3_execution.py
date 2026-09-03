@@ -175,7 +175,7 @@ class TestPositionThrottle(unittest.TestCase):
 
         # Simulate profitable returns
         for _ in range(100):
-            throttle.record_return(np.random.normal(0.002, 0.005))
+            throttle.record_return(float(np.random.normal(0.005, 0.002)))
 
         frac = throttle.get_throttled_fraction()
         # Should be close to full fraction

@@ -13,7 +13,7 @@ import os
 import time
 import logging
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Any, Dict, List, Tuple
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] (RiskGuardian) %(message)s")
 logger = logging.getLogger("RiskGuardian")
@@ -30,19 +30,57 @@ class RiskLimits:
     kill_switch_path: str = "state/KILL_SWITCH"   # touch this file to halt trading immediately
 
 
+@dataclass
+class RiskState:
+    is_halted: bool = False
+    halt_reason: str = ""
+    current_equity: float = 100.0
+    daily_start_equity: float = 100.0
+    peak_equity: float = 100.0
+    orders_last_minute: int = 0
+
+
 class RiskGuardian:
     """
-    Call `check(...)` before every order submission. If it returns
-    (False, reason), do not submit the order — log the rejection and continue
-    the loop; do not raise, since a halted trading loop should keep observing
-    the market and reporting status, not crash.
+    Risk guardian safety layer. Supports both:
+    1. Direct per-tick check(target_frac, ...) used by LivePaperInferenceServer
+    2. Order-by-order check_order_allowed(side, qty, price) used by ExchangeAdapter/tests
     """
 
-    def __init__(self, limits: Optional[RiskLimits] = None):
-        self.limits = limits or RiskLimits()
+    def __init__(
+        self,
+        limits: Optional[RiskLimits] = None,
+        exchange: Optional[Any] = None,
+        symbol: str = "BTC/USDT",
+        max_position_fraction: Optional[float] = None,
+        max_daily_loss_pct: Optional[float] = None,
+        max_drawdown_halt: Optional[float] = None,
+        min_hold_ticks: Optional[int] = None,
+        max_orders_per_minute: Optional[int] = None,
+        starting_equity: float = 100.0,
+        **kwargs,
+    ):
+        if limits is None:
+            limits = RiskLimits(
+                max_position_fraction=max_position_fraction if max_position_fraction is not None else 0.5,
+                max_daily_loss_pct=max_daily_loss_pct if max_daily_loss_pct is not None else 0.05,
+                max_drawdown_halt=max_drawdown_halt if max_drawdown_halt is not None else 0.15,
+                min_hold_ticks=min_hold_ticks if min_hold_ticks is not None else 100,
+                max_orders_per_minute=max_orders_per_minute if max_orders_per_minute is not None else 6,
+            )
+        self.limits = limits
+        self.exchange = exchange
+        self.symbol = symbol
+        self.starting_equity = starting_equity
+        self.state = RiskState(
+            current_equity=starting_equity,
+            daily_start_equity=starting_equity,
+            peak_equity=starting_equity,
+        )
         self._order_timestamps: list = []
         self._last_flip_tick: int = -10**9
-        self._daily_start_equity: Optional[float] = None
+        self._current_tick: int = 0
+        self._daily_start_equity: Optional[float] = starting_equity
         self._daily_start_time = time.time()
         self._halted = False
         self._halt_reason: Optional[str] = None
@@ -58,6 +96,96 @@ class RiskGuardian:
 
     def kill_switch_engaged(self) -> bool:
         return os.path.exists(self.limits.kill_switch_path)
+
+    def update_equity(self, current_equity: float):
+        """Update tracked equity and verify daily loss / drawdown thresholds."""
+        self.state.current_equity = current_equity
+        if current_equity > self.state.peak_equity:
+            self.state.peak_equity = current_equity
+        self._reset_daily_if_needed(current_equity)
+
+        if self._daily_start_equity and self._daily_start_equity > 0:
+            loss_pct = (self._daily_start_equity - current_equity) / self._daily_start_equity
+            if loss_pct >= self.limits.max_daily_loss_pct:
+                self._halted = True
+                self.state.is_halted = True
+                self.state.halt_reason = f"Daily loss {loss_pct*100:.1f}% exceeded limit"
+                self._halt_reason = "max_daily_loss_breached"
+                logger.critical(f"RiskGuardian: Daily loss {loss_pct*100:.2f}% breached! Trading halted.")
+
+        if self.state.peak_equity > 0:
+            dd = (self.state.peak_equity - current_equity) / self.state.peak_equity
+            if dd >= self.limits.max_drawdown_halt:
+                self._halted = True
+                self.state.is_halted = True
+                self.state.halt_reason = f"Drawdown {dd*100:.1f}% exceeded limit"
+                self._halt_reason = "max_drawdown_breached"
+                logger.critical(f"RiskGuardian: Drawdown {dd*100:.2f}% breached! Trading halted.")
+
+    def check_order_allowed(self, side: str, qty: float, price: float) -> tuple:
+        """Compatibility check: verifies order against position size, rate limits, and halts."""
+        if self._halted or self.state.is_halted:
+            return False, f"Trading halted: {self.state.halt_reason or self._halt_reason}"
+
+        if self.kill_switch_engaged():
+            self._halted = True
+            self.state.is_halted = True
+            self.state.halt_reason = "kill_switch_engaged"
+            return False, "KILL SWITCH ENGAGED"
+
+        order_cost = abs(qty * price)
+        max_cost = self.state.current_equity * self.limits.max_position_fraction
+        if order_cost > max_cost + 1e-6:
+            return False, f"Position size ${order_cost:.2f} exceeds limit ${max_cost:.2f}"
+
+        now = time.time()
+        self._order_timestamps = [t for t in self._order_timestamps if now - t < 60.0]
+        if len(self._order_timestamps) >= self.limits.max_orders_per_minute:
+            return False, f"Rate limit: {len(self._order_timestamps)} orders placed in the last 60s"
+
+        return True, "PASSED"
+
+    def record_order_executed(self, side: str, qty: float):
+        """Record order execution timestamp for rate limiting."""
+        self._order_timestamps.append(time.time())
+
+    async def execute_safe_order(self, side: str, qty: float, price: float):
+        """Pre-trade risk check followed by order execution on exchange if approved."""
+        allowed, reason = self.check_order_allowed(side, qty, price)
+        if not allowed:
+            from execution.exchange_adapter import OrderResult
+            return OrderResult(
+                order_id="REJECTED-RISK",
+                symbol=self.symbol,
+                side=side,
+                qty=0.0,
+                avg_price=0.0,
+                cost=0.0,
+                fee=0.0,
+                timestamp=time.time(),
+                status="rejected",
+                raw={"reason": reason},
+            )
+        if self.exchange is not None:
+            res = await self.exchange.place_market_order(self.symbol, side, qty)
+            self.record_order_executed(side, qty)
+            return res
+        return None
+
+    def get_risk_summary(self) -> dict:
+        """Return risk guardian status summary."""
+        now = time.time()
+        self._order_timestamps = [t for t in self._order_timestamps if now - t < 60.0]
+        is_conn = True
+        if self.exchange is not None and hasattr(self.exchange, "is_connected"):
+            is_conn = self.exchange.is_connected()
+        return {
+            "equity": self.state.current_equity,
+            "is_halted": self.state.is_halted or self._halted,
+            "halt_reason": self.state.halt_reason or self._halt_reason,
+            "exchange_connected": is_conn,
+            "orders_last_minute": len(self._order_timestamps),
+        }
 
     def check(
         self,
@@ -75,6 +203,7 @@ class RiskGuardian:
         if self.kill_switch_engaged():
             self._halted = True
             self._halt_reason = "kill_switch_file_present"
+            self.state.is_halted = True
             logger.critical(f"KILL SWITCH ENGAGED ({self.limits.kill_switch_path}). Halting all trading.")
             return False, self._halt_reason
 
@@ -97,6 +226,7 @@ class RiskGuardian:
             daily_pnl_pct = (equity - self._daily_start_equity) / self._daily_start_equity
             if daily_pnl_pct <= -self.limits.max_daily_loss_pct:
                 self._halted = True
+                self.state.is_halted = True
                 self._halt_reason = "max_daily_loss_breached"
                 logger.critical(
                     f"MAX DAILY LOSS BREACHED: {daily_pnl_pct*100:.2f}% "
@@ -106,6 +236,7 @@ class RiskGuardian:
 
         if max_drawdown >= self.limits.max_drawdown_halt:
             self._halted = True
+            self.state.is_halted = True
             self._halt_reason = "max_drawdown_breached"
             logger.critical(
                 f"MAX DRAWDOWN BREACHED: {max_drawdown*100:.2f}% "
@@ -123,7 +254,9 @@ class RiskGuardian:
         """Manual override to resume after a halt — not called automatically."""
         logger.warning(f"Risk guardian halt manually reset (was: {self._halt_reason}).")
         self._halted = False
+        self.state.is_halted = False
         self._halt_reason = None
+        self.state.halt_reason = ""
 
 
 if __name__ == "__main__":

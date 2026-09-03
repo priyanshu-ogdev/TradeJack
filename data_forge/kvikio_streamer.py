@@ -135,7 +135,7 @@ class KvikIODataForge:
                 INSERT INTO container_fifo (container_name, symbol, tail_data)
                 VALUES (?, ?, ?)
                 ON CONFLICT(container_name, symbol) DO UPDATE SET tail_data = excluded.tail_data
-            """, (container_name, symbol, json.dumps(data)))
+            """, (container_name, symbol, json.dumps(data, default=str)))
             conn.commit()
             conn.close()
         except Exception as e:

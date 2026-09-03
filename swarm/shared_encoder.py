@@ -76,8 +76,15 @@ class LOBFeatureEncoder(nn.Module):
         channels: int = 64,
         dilations: tuple = (1, 2, 4, 8),
         features_dim: int = 128,
+        **kwargs,
     ):
         super().__init__()
+        if "lob_features" in kwargs:
+            lob_input_dim = kwargs["lob_features"]
+        if "portfolio_features" in kwargs:
+            portfolio_input_dim = kwargs["portfolio_features"]
+        if "hidden_dim" in kwargs:
+            channels = kwargs["hidden_dim"]
         self.features_dim = features_dim
 
         # LOB sequence encoder: project input features to channel dim, then dilated CNN

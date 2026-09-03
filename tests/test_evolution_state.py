@@ -34,11 +34,11 @@ class TestEvolutionAndRollback(unittest.TestCase):
         self.assertGreaterEqual(len(model_names), 4)
 
     def test_model_registry_tier_filtering(self):
-        """Verify tier-based model filtering works."""
+        """Verify tier-based model filtering works (lower tier number = higher compute capacity)."""
+        tier1 = REGISTRY.list_models_for_tier(max_tier=1)
         tier2 = REGISTRY.list_models_for_tier(max_tier=2)
-        tier3 = REGISTRY.list_models_for_tier(max_tier=3)
-        # Tier 3 should have all models tier 2 has plus more
-        self.assertGreaterEqual(len(tier3), len(tier2))
+        # Tier 1 (20GB GPU) should have all models tier 2 has plus more
+        self.assertGreaterEqual(len(tier1), len(tier2))
 
     def test_model_card_lookup(self):
         """Verify model card lookup returns correct metadata."""

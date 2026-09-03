@@ -47,15 +47,25 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] (Pap
 logger = logging.getLogger("PaperExchange")
 
 from physics.portfolio_tracker import PortfolioAccountingEngine
+from execution.exchange_adapter import ExchangeAdapter, OrderResult, OrderBook
 
 
 @dataclass
 class ExchangeFilters:
-    """Illustrative defaults — verify against GET /api/v3/exchangeInfo for the
-    real symbol before relying on these for anything but logic testing."""
+    """Symbol exchange trading rules and filters (min_notional, step_size, tick_size)."""
     min_notional: float = 10.0
     step_size: float = 0.00001
     tick_size: float = 0.01
+
+    @classmethod
+    def from_market(cls, market_dict: Dict[str, Any]) -> "ExchangeFilters":
+        """Builds ExchangeFilters from CCXT or Binance market dictionary."""
+        limits = market_dict.get("limits", {})
+        precision = market_dict.get("precision", {})
+        min_notional = float(limits.get("cost", {}).get("min", 10.0) or 10.0)
+        step_size = float(limits.get("amount", {}).get("min", 0.00001) or 0.00001)
+        tick_size = float(limits.get("price", {}).get("min", 0.01) or 0.01)
+        return cls(min_notional=min_notional, step_size=step_size, tick_size=tick_size)
 
 
 @dataclass
@@ -264,6 +274,163 @@ class PaperExchange:
 
     def close(self):
         self.accounting.close()
+
+
+class PaperExchangeAdapter(ExchangeAdapter):
+    """
+    Simulated exchange for paper trading conforming to ExchangeAdapter interface.
+    Used by scripts/run_all_checks.py and tests/test_v3_execution.py.
+    """
+
+    def __init__(
+        self,
+        initial_balance_usdt: float = 100.0,
+        taker_fee_bps: float = 10.0,
+        simulated_kyles_lambda: float = 0.001,
+    ):
+        self.balances: Dict[str, float] = {"USDT": initial_balance_usdt}
+        self.taker_fee_rate = taker_fee_bps / 10_000.0
+        self.kyles_lambda = simulated_kyles_lambda
+        self._connected = True
+        self.order_history: List[OrderResult] = []
+        self._order_counter = 0
+
+        self._current_prices: Dict[str, float] = {
+            "BTC/USDT": 60000.0,
+            "BTC-USDT": 60000.0,
+            "ETH/USDT": 3000.0,
+            "ETH-USDT": 3000.0,
+            "SOL/USDT": 150.0,
+            "SOL-USDT": 150.0,
+        }
+
+    async def connect(self) -> None:
+        self._connected = True
+
+    async def close(self) -> None:
+        self._connected = False
+
+    def is_connected(self) -> bool:
+        return self._connected
+
+    def set_price(self, symbol: str, price: float):
+        self._current_prices[symbol] = price
+        norm_sym = symbol.replace("-", "/")
+        self._current_prices[norm_sym] = price
+
+    async def get_ticker(self, symbol: str) -> float:
+        norm_sym = symbol.replace("-", "/")
+        return self._current_prices.get(norm_sym, self._current_prices.get(symbol, 0.0))
+
+    async def get_orderbook(self, symbol: str, depth: int = 5) -> OrderBook:
+        mid = await self.get_ticker(symbol)
+        if mid <= 0:
+            return OrderBook(symbol=symbol, bids=[], asks=[], timestamp=time.time(), mid_price=0.0)
+
+        spread = mid * 0.0001
+        bids = [[mid - spread * (i + 1), 1.0 + i * 0.5] for i in range(depth)]
+        asks = [[mid + spread * (i + 1), 1.0 + i * 0.5] for i in range(depth)]
+        return OrderBook(symbol=symbol, bids=bids, asks=asks, timestamp=time.time(), mid_price=mid)
+
+    async def get_balance(self, asset: str) -> float:
+        return self.balances.get(asset, 0.0)
+
+    async def get_all_balances(self) -> Dict[str, float]:
+        return {k: v for k, v in self.balances.items() if v > 0}
+
+    def _compute_fill_price(self, symbol: str, side: str, qty: float) -> float:
+        norm_sym = symbol.replace("-", "/")
+        mid = self._current_prices.get(norm_sym, self._current_prices.get(symbol, 0.0))
+        if mid <= 0:
+            return 0.0
+        slippage = self.kyles_lambda * abs(qty)
+        if side == "buy":
+            return mid + slippage * mid
+        else:
+            return mid - slippage * mid
+
+    async def place_market_order(self, symbol: str, side: str, qty: float) -> OrderResult:
+        self._order_counter += 1
+        order_id = f"PAPER-{self._order_counter:06d}"
+
+        fill_price = self._compute_fill_price(symbol, side, qty)
+        if fill_price <= 0:
+            return OrderResult(
+                order_id=order_id, symbol=symbol, side=side, qty=0.0,
+                avg_price=0.0, cost=0.0, fee=0.0, timestamp=time.time(),
+                status="rejected", raw={"error": f"No price for {symbol}"},
+            )
+
+        notional = qty * fill_price
+        fee = notional * self.taker_fee_rate
+
+        parts = symbol.replace("-", "/").split("/")
+        base = parts[0] if len(parts) >= 2 else symbol
+        quote = parts[1] if len(parts) >= 2 else "USDT"
+
+        if side == "buy":
+            total_cost = notional + fee
+            if self.balances.get(quote, 0.0) < total_cost:
+                return OrderResult(
+                    order_id=order_id, symbol=symbol, side=side, qty=0.0,
+                    avg_price=fill_price, cost=0.0, fee=0.0, timestamp=time.time(),
+                    status="rejected", raw={"error": "Insufficient balance"},
+                )
+            self.balances[quote] = self.balances.get(quote, 0.0) - total_cost
+            self.balances[base] = self.balances.get(base, 0.0) + qty
+
+        elif side == "sell":
+            if self.balances.get(base, 0.0) < qty:
+                return OrderResult(
+                    order_id=order_id, symbol=symbol, side=side, qty=0.0,
+                    avg_price=fill_price, cost=0.0, fee=0.0, timestamp=time.time(),
+                    status="rejected", raw={"error": "Insufficient balance"},
+                )
+            self.balances[base] = self.balances.get(base, 0.0) - qty
+            self.balances[quote] = self.balances.get(quote, 0.0) + notional - fee
+
+        result = OrderResult(
+            order_id=order_id, symbol=symbol, side=side, qty=qty,
+            avg_price=fill_price, cost=notional, fee=fee,
+            timestamp=time.time(), status="filled",
+        )
+        self.order_history.append(result)
+        return result
+
+    async def get_open_orders(self, symbol: str) -> List[Dict[str, Any]]:
+        return []
+
+    async def cancel_all_orders(self, symbol: str) -> int:
+        return 0
+
+    async def get_position(self, symbol: str) -> Dict[str, float]:
+        parts = symbol.replace("-", "/").split("/")
+        base = parts[0] if len(parts) >= 2 else symbol
+        qty = self.balances.get(base, 0.0)
+        return {"qty": qty, "entry_price": 0.0}
+
+    def get_equity(self, base_symbol: str = "BTC/USDT") -> float:
+        total = self.balances.get("USDT", 0.0)
+        for asset, qty in self.balances.items():
+            if asset == "USDT" or qty <= 0:
+                continue
+            sym = f"{asset}/USDT"
+            price = self._current_prices.get(sym, 0.0)
+            total += qty * price
+        return total
+
+    def get_trade_summary(self) -> Dict[str, Any]:
+        buys = [o for o in self.order_history if o.side == "buy" and o.status == "filled"]
+        sells = [o for o in self.order_history if o.side == "sell" and o.status == "filled"]
+        total_fees = sum(o.fee for o in self.order_history if o.status == "filled")
+        return {
+            "total_trades": len(self.order_history),
+            "filled_buys": len(buys),
+            "filled_sells": len(sells),
+            "total_fees": round(total_fees, 6),
+            "final_equity": round(self.get_equity(), 4),
+            "balances": {k: round(v, 8) for k, v in self.balances.items() if v > 0},
+        }
 
 
 if __name__ == "__main__":
