@@ -1,0 +1,71 @@
+# TradeJack live/testnet trading service — systemd unit template.
+#
+# See docs/PROCESS_SUPERVISION.md for the full picture (this is one of two
+# supervision options, and the SIGTERM-graceful-shutdown fix in
+# scripts/genesis_prime.py that this relies on).
+#
+# Adjust User, WorkingDirectory, ExecStart's venv path, and the --mode/--symbol/
+# --capital flags for your actual deployment before installing.
+#
+# Install:
+#   sudo cp deploy/systemd/tradejack-live.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now tradejack-live
+#
+# `systemctl stop tradejack-live` sends SIGTERM, then SIGKILL after
+# TimeoutStopSec if the process hasn't exited -- with the SIGTERM fix in
+# genesis_prime.py, SIGTERM now actually triggers server.stop()/trainer.stop()
+# instead of an immediate kill.
+
+[Unit]
+Description=TradeJack Live Trading (genesis_prime.py)
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=3600
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=tradejack
+Group=tradejack
+WorkingDirectory=/opt/tradejack/TradeJack
+
+# Point this at your actual venv/interpreter.
+ExecStart=/opt/tradejack/venv/bin/python -m scripts.genesis_prime --mode testnet --symbol BTC-USDT --capital 100.0
+
+# --- Crash-recovery policy ---
+# Restart=always covers the "process exited unexpectedly" case this whole
+# item exists for. RestartSec is systemd's equivalent of the backoff in
+# scripts/process_supervisor.py -- if you're running this unit directly
+# (not wrapping genesis_prime.py in process_supervisor.py inside it), keep
+# a real delay here for the same reason process_supervisor.py backs off:
+# a crash loop that reconnects to a real exchange every second is worse
+# than one that isn't running at all.
+Restart=always
+RestartSec=30
+
+# StartLimitIntervalSec / StartLimitBurst above (5 restarts per hour) is
+# systemd's own circuit breaker -- once tripped, the unit goes into
+# "failed" state and systemd stops restarting it automatically. Check
+# `systemctl status tradejack-live` and `journalctl -u tradejack-live` to
+# see why before `systemctl reset-failed tradejack-live && systemctl start
+# tradejack-live` to resume. This is the systemd-native equivalent of
+# process_supervisor.py's CIRCUIT_BREAKER_OPEN.json -- same principle
+# (stop and page a human rather than loop forever), different mechanism.
+
+# Give the graceful-shutdown path (server.stop() + trainer.stop() +
+# exchange cleanup) real time to finish before systemd escalates to
+# SIGKILL on `systemctl stop`.
+TimeoutStopSec=30
+KillSignal=SIGTERM
+
+# Environment for exchange API credentials -- prefer an EnvironmentFile
+# over inlining secrets in this unit file, which is often world-readable.
+# EnvironmentFile=/etc/tradejack/live.env
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=tradejack-live
+
+[Install]
+WantedBy=multi-user.target

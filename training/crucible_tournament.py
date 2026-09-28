@@ -178,6 +178,7 @@ class CrucibleTournament:
         roster: Optional[List[Dict[str, Any]]] = None,
         pbt_interval: int = 50000,
         pbt_exploit_fraction: float = 0.3,
+        inject_synthetic_scenarios: bool = True,
     ):
         self.data_store_dir = os.path.abspath(data_store_dir)
         self.state_dir = os.path.abspath(state_dir)
@@ -190,6 +191,24 @@ class CrucibleTournament:
         )
 
         os.makedirs(self.state_dir, exist_ok=True)
+
+        # PHASE 3: agents used to only ever see one hardcoded, fixed-seed flash-crash
+        # day (data_forge/parquet_ingest.py's generate_synthetic_crucible_data, day
+        # index 1, same shape every single run) as their only tail-risk exposure.
+        # training/scenario_injection.py materializes several structurally different
+        # regimes (flash crash, melt-up squeeze, two-sided high-vol, liquidity
+        # vacuum) as reserved-date partitions in the exact directory TradeJackLOBEnv
+        # already scans -- so this needs no changes to the env itself. Wrapped in
+        # try/except: a data-injection failure (missing polars, a permissions issue)
+        # must degrade to "tournament runs without the extra synthetic days," never
+        # block tournament construction entirely.
+        if inject_synthetic_scenarios:
+            try:
+                from training.scenario_injection import inject_synthetic_scenarios as _inject
+
+                _inject(symbol=self.symbol, data_store_dir=self.data_store_dir)
+            except Exception as e:
+                logger.warning(f"Synthetic scenario injection failed (tournament continues without it): {e}")
 
         from swarm.training_progress_ledger import TrainingProgressLedger
         self.progress_ledger = TrainingProgressLedger(state_dir=self.state_dir)

@@ -37,6 +37,7 @@ except ImportError:
 
 from training.walk_forward_evaluator import WalkForwardEvaluator
 from training.crucible_tournament import CrucibleTournament
+from scripts.deploy_config import DEPLOY_CONFIG
 
 
 class ContinuousTrainer:
@@ -67,6 +68,7 @@ class ContinuousTrainer:
         inference_server=None,
         plasticity_reset_interval_cycles: int = 5,
         plasticity_fisher_reset_fraction: float = 0.5,
+        bridge_live_data_every_cycles: int = 1,
     ):
         self.training_model_name = training_model_name
         self.data_store_dir = os.path.abspath(data_store_dir)
@@ -76,6 +78,24 @@ class ContinuousTrainer:
         self.train_interval = train_interval_minutes * 60  # Convert to seconds
         self.timesteps_per_cycle = timesteps_per_cycle
         self.inference_server = inference_server
+        # PHASE 1 FIX: `DEPLOY_CONFIG.auto_promotion` used to be asserted at
+        # construction and never actually checked -- _evaluate_and_promote()
+        # promoted the instant the statistical gate passed, regardless of this
+        # flag's value. See _evaluate_and_promote() and approve_pending_promotion()
+        # below for the real gate. Keyed by agent_id; holds the in-memory champion
+        # object (including its live SB3 model, needed for the EWC re-anchor step)
+        # for any promotion awaiting human approval in THIS process.
+        self.pending_promotions: Dict[int, Any] = {}
+
+        # PHASE 2 FIX: "continuous" training used to mean continuous re-training on
+        # the same synthetic-plus-stale-bulk data mix, cycle after cycle, regardless
+        # of what actually happened in the live market during testnet/live operation
+        # -- nothing bridged data_forge/lob_collector.py's live captures into the
+        # data_store/processed/ tier TradeJackLOBEnv actually trains on. See
+        # _bridge_live_data() below. bridge_live_data_every_cycles=1 means every
+        # cycle by default; raise it to reduce redundant I/O on a fast train_interval
+        # -- bridging is idempotent (safe to re-run on the same day) either way.
+        self.bridge_live_data_every_cycles = max(1, bridge_live_data_every_cycles)
 
         # Initialize components
         self.tournament = CrucibleTournament(
@@ -108,6 +128,53 @@ class ContinuousTrainer:
         self.promotion_count = 0
         self.is_running = False
 
+    def _bridge_live_data(self) -> None:
+        """
+        PHASE 2: closes the "real live market experience never reaches retraining"
+        gap. Bridges today's and yesterday's data_forge/lob_collector.py live trade
+        captures into TradeFlowPhysics's expected input location, then runs the
+        existing, hardened batch bucketing pipeline over them -- see
+        data_forge/live_trade_bridge.py's module docstring for why this reuses the
+        batch pipeline rather than reimplementing an approximation of it.
+
+        Both "today" and "yesterday" (UTC) are bridged every time this runs, not
+        just whichever just turned over: "today" is normally still accumulating
+        (only whatever hours have flushed so far), and re-bridging "yesterday" is
+        what picks up its last few hours once the day is actually complete. Both
+        operations are idempotent (bridge_live_trades_to_raw() always
+        overwrites-then-atomic-renames the same output path for a given date), so
+        there's no harm in repeating a day that hasn't changed.
+
+        Deliberately does not know or care whether TradeJackLOBEnv re-globs
+        data_store/processed/ per-episode or only at environment construction --
+        that's physics/lob_env.py's concern, not this method's. This just
+        guarantees the freshest possible physics file is on disk before this
+        cycle's agent.train() calls run, which is the most this layer can
+        responsibly promise without inspecting (or coupling to) the env's own
+        internal caching behavior.
+
+        Never allowed to crash the training loop: any failure here (a corrupt
+        capture file, a permissions issue, polars/config unavailable, anything)
+        is logged and skipped, not raised -- a bad live-data refresh should cost
+        this cycle's freshness, not the whole continuous-training process.
+        """
+        try:
+            from data_forge.live_trade_bridge import bridge_live_trades_to_raw
+            from data_forge.feature_engineering import TradeFlowPhysics
+
+            physics_engine = TradeFlowPhysics(self.symbol)
+            now = time.gmtime()
+            today = time.strftime("%Y-%m-%d", now)
+            yesterday = time.strftime("%Y-%m-%d", time.gmtime(time.time() - 86400))
+
+            for date in (yesterday, today):
+                bridged = bridge_live_trades_to_raw(self.symbol, date, data_store_dir=self.data_store_dir)
+                if bridged:
+                    physics_engine.process_daily_file(date)
+                    logger.info(f"Live data bridged and processed for {self.symbol} on {date}.")
+        except Exception as e:
+            logger.error(f"Live data bridge failed this cycle (training continues on existing data): {e}")
+
     async def run_continuous(self, max_cycles: Optional[int] = None):
         """
         Main continuous training loop.
@@ -128,6 +195,9 @@ class ContinuousTrainer:
             while self.is_running:
                 self.cycle_count += 1
                 logger.info(f"=== Training Cycle {self.cycle_count} ===")
+
+                if self.cycle_count % self.bridge_live_data_every_cycles == 0:
+                    self._bridge_live_data()
 
                 try:
                     # 1. Run one tournament training cycle
@@ -228,7 +298,10 @@ class ContinuousTrainer:
             )
 
             if passed:
-                self._promote_champion(champion)
+                if getattr(DEPLOY_CONFIG, "auto_promotion", False):
+                    self._promote_champion(champion)
+                else:
+                    self._queue_pending_promotion(champion, report)
             else:
                 logger.info(f"Champion did not pass promotion gates: {report['verdict']}")
 
@@ -236,6 +309,118 @@ class ContinuousTrainer:
 
         except Exception as e:
             logger.error(f"Evaluation error: {e}")
+
+    def _pending_promotion_record_path(self, agent_id: int) -> str:
+        return os.path.join(self.state_dir, "pending_promotions", f"agent_{agent_id}.json")
+
+    def _queue_pending_promotion(self, champion, report: Dict[str, Any]) -> None:
+        """
+        PHASE 1 FIX: with `DEPLOY_CONFIG.auto_promotion=False` (the default), a
+        champion that passes the statistical gate is no longer promoted immediately.
+        It's queued here instead: recorded in-memory (self.pending_promotions, so
+        approve_pending_promotion() can complete the full promotion including the
+        EWC re-anchor step, which needs the live model object) and persisted to disk
+        as a JSON record (so a human-facing tool -- dashboard, CLI, whatever -- has
+        something durable to read and act on across process restarts, even though
+        cross-process approval can only redo the checkpoint-copy step, not the EWC
+        re-anchor -- see approve_pending_promotion()'s docstring for that limitation).
+        """
+        import json
+        from datetime import datetime, timezone
+
+        self.pending_promotions[champion.agent_id] = champion
+
+        record_path = self._pending_promotion_record_path(champion.agent_id)
+        os.makedirs(os.path.dirname(record_path), exist_ok=True)
+        src = champion.checkpoint_path + ".zip"
+        if not os.path.exists(src):
+            src = champion.checkpoint_path
+        record = {
+            "agent_id": champion.agent_id,
+            "label": champion.label,
+            "checkpoint_path": src,
+            "verdict": report.get("verdict"),
+            "avg_sharpe": report.get("avg_sharpe"),
+            "max_drawdown": report.get("max_drawdown"),
+            "queued_at_utc": datetime.now(timezone.utc).isoformat(),
+        }
+        with open(record_path, "w") as f:
+            json.dump(record, f, indent=2)
+
+        logger.warning(
+            f"Champion Agent {champion.agent_id} ({champion.label}) PASSED promotion gates "
+            f"but auto_promotion=False -- NOT promoted automatically. Pending record written "
+            f"to '{record_path}'. Call trainer.approve_pending_promotion({champion.agent_id}) "
+            f"(same process) or otherwise act on that record to actually deploy it."
+        )
+
+    def approve_pending_promotion(self, agent_id: int) -> bool:
+        """
+        Completes a promotion that was queued by _queue_pending_promotion(). This is
+        the human-in-the-loop step `auto_promotion=False` is meant to require.
+
+        Returns True if a promotion was completed, False if there was nothing pending
+        for this agent_id (in-memory or on disk).
+        """
+        champion = self.pending_promotions.pop(agent_id, None)
+        record_path = self._pending_promotion_record_path(agent_id)
+
+        if champion is not None:
+            # Full path: same process the evaluation ran in, so champion.trainer.model
+            # is still a live object -- _promote_champion can do the complete job,
+            # EWC re-anchor included.
+            self._promote_champion(champion)
+            if os.path.exists(record_path):
+                os.remove(record_path)
+            return True
+
+        if os.path.exists(record_path):
+            # Cross-process approval: the champion object (and its live model) no
+            # longer exists in this process, so this can only redo the checkpoint
+            # copy + hot-swap, not the EWC re-anchor step. Stated plainly rather than
+            # silently skipped, since it's a real (if minor) difference in behavior
+            # from same-process approval.
+            import json
+
+            with open(record_path, "r") as f:
+                record = json.load(f)
+            src = record["checkpoint_path"]
+            if not os.path.exists(src):
+                logger.error(f"Pending promotion checkpoint not found: {src}")
+                return False
+            dst = self.deployed_model_path + ".zip"
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            shutil.copy2(src, dst)
+            self.promotion_count += 1
+            logger.warning(
+                f"Approved cross-process promotion for agent {agent_id}: {src} -> {dst}. "
+                f"NOTE: EWC re-anchor was skipped (no live model object in this process) -- "
+                f"the next training cycle will regularize against whatever was last "
+                f"in-process-promoted, not this checkpoint, until that happens naturally."
+            )
+            if self.inference_server and hasattr(self.inference_server, "hot_swap_model"):
+                self.inference_server.hot_swap_model(self.deployed_model_path)
+            os.remove(record_path)
+            return True
+
+        logger.warning(f"No pending promotion found for agent_id={agent_id}.")
+        return False
+
+    def list_pending_promotions(self) -> Dict[int, Dict[str, Any]]:
+        """Reads every on-disk pending-promotion record, for a dashboard/CLI to show
+        an operator what's awaiting approval, without needing this process's memory."""
+        import json
+
+        out = {}
+        pending_dir = os.path.join(self.state_dir, "pending_promotions")
+        if not os.path.isdir(pending_dir):
+            return out
+        for fname in os.listdir(pending_dir):
+            if fname.endswith(".json"):
+                with open(os.path.join(pending_dir, fname)) as f:
+                    record = json.load(f)
+                out[record["agent_id"]] = record
+        return out
 
     def _promote_champion(self, champion):
         """Atomically promote champion model to the deployed model path."""

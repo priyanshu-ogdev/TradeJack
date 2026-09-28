@@ -13,12 +13,14 @@ v3 Upgrade:
 
 import os
 import sys
+import glob
 import time
 import math
 import random
 import json
 import logging
 import numpy as np
+from datetime import datetime, timezone, timedelta
 from typing import Dict, Any, List, Optional, Tuple
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] (ValidationAirgap) %(message)s")
@@ -46,6 +48,63 @@ LEGACY_MODEL_MAP = {
     "LSTM-Seq2Seq-VAE": "SAC-DilatedCNN",
     "Actor-Critic-Duel-Agent": "SAC-DilatedCNN",
 }
+
+
+def latest_processed_data_date(symbol: str, data_store_dir: str) -> Optional[str]:
+    """
+    PHASE 2: scans data_store/processed/{symbol}/physics/{Y}/{M}/{D}/*.parquet for the
+    most recent date a physics file actually exists for, by partition directory name
+    (not file mtime -- a file's mtime can be newer than the market data it contains,
+    e.g. if it was re-processed or copied; the Y/M/D partition path is what the data
+    itself claims to represent, matching how feature_engineering.py writes it and how
+    training/continuous_trainer.py's _bridge_live_data() names it).
+
+    Returns "YYYY-MM-DD", or None if no processed physics files exist at all for this
+    symbol (a fresh install, or a symbol that's never been processed) -- distinct from
+    "found files but they're all old," which returns a real (stale) date instead.
+
+    Pure filesystem logic -- no torch/polars/pydantic_settings dependency, so this is
+    fully testable and usable even in environments missing those.
+    """
+    physics_dir = os.path.join(data_store_dir, "processed", symbol, "physics")
+    pattern = os.path.join(physics_dir, "*", "*", "*", "*.parquet")
+    files = glob.glob(pattern)
+    if not files:
+        return None
+
+    dates = []
+    for f in files:
+        # Path shape: .../physics/{Y}/{M}/{D}/whatever.parquet -- pull Y/M/D from the
+        # three directory components immediately above the file, not from the
+        # filename (which varies: "physics.parquet" for the bulk pipeline output).
+        parts = os.path.normpath(f).split(os.sep)
+        try:
+            day, month, year = parts[-2], parts[-3], parts[-4]
+            dates.append(f"{year}-{month}-{day}")
+        except IndexError:
+            continue  # unexpected path shape -- skip rather than crash the whole scan
+
+    if not dates:
+        return None
+    return max(dates)  # ISO "YYYY-MM-DD" strings sort correctly as plain strings
+
+
+def check_data_freshness(
+    symbol: str, data_store_dir: str, max_staleness_days: int
+) -> Tuple[bool, Optional[str], Optional[int]]:
+    """
+    Returns (is_fresh, latest_date_found, days_stale). is_fresh=False whenever
+    either no processed data exists at all, or the newest partition found is older
+    than max_staleness_days relative to now (UTC). days_stale is None when
+    latest_date_found is None (nothing to measure staleness against).
+    """
+    latest = latest_processed_data_date(symbol, data_store_dir)
+    if latest is None:
+        return False, None, None
+
+    latest_dt = datetime.strptime(latest, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+    days_stale = (datetime.now(timezone.utc) - latest_dt).days
+    return days_stale <= max_staleness_days, latest, days_stale
 
 
 class ValidationAirgapEngine:
@@ -228,12 +287,54 @@ class ValidationAirgapEngine:
         weights_path: str,
         model_type: str,
         min_sharpe_override: float = 1.0,
-        max_drawdown_override: float = 0.15
+        max_drawdown_override: float = 0.15,
+        symbol: str = "BTC-USDT",
+        max_staleness_days: Optional[int] = None,
     ) -> dict:
         """
         Strict promotion gate for Crucible->Deployment transition.
-        Candidate must clear: Avg Sharpe >= 1.0, Max DD <= 15%.
+        Candidate must clear: Avg Sharpe >= 1.0, Max DD <= 15%, AND the training data
+        this evaluation actually ran against must not be stale (see
+        check_data_freshness()) -- a promotion decision made on data that's stopped
+        updating is the same failure mode as the force-promoted, statistically-
+        rejected checkpoint this project's own history already found sitting in
+        state/deployed/ once, just quieter: everything downstream (Sharpe, drawdown)
+        can look fine while measuring a market that no longer exists.
+
+        max_staleness_days=None (the default) reads
+        DEPLOY_CONFIG.max_training_data_staleness_days at call time rather than at
+        import time, so changing the config value doesn't require re-importing this
+        module.
         """
+        if max_staleness_days is None:
+            from scripts.deploy_config import DEPLOY_CONFIG
+
+            max_staleness_days = getattr(DEPLOY_CONFIG, "max_training_data_staleness_days", 3)
+
+        is_fresh, latest_date, days_stale = check_data_freshness(symbol, self.data_store_dir, max_staleness_days)
+        if not is_fresh:
+            if latest_date is None:
+                reason = f"no processed physics data found for {symbol} in {self.data_store_dir}"
+            else:
+                reason = f"newest available data is from {latest_date} ({days_stale} day(s) old, limit {max_staleness_days})"
+            logger.warning(
+                f"[PROMOTION GATE BLOCKED — DATA STALE] {weights_path}: {reason}. "
+                f"Refusing to run the (expensive) airgap simulation against data this stale — "
+                f"fix the data pipeline (see training/continuous_trainer.py's _bridge_live_data()) "
+                f"before re-attempting promotion."
+            )
+            return {
+                "passed": False,
+                "weights_path": weights_path,
+                "model_type": self._resolve_model_name(model_type),
+                "avg_sharpe": None,
+                "average_sharpe": None,
+                "max_drawdown": None,
+                "reason": "data_stale",
+                "data_staleness_detail": reason,
+                "split_results": None,
+            }
+
         resolved = self._resolve_model_name(model_type)
         original_sharpe = self.min_sharpe
         original_dd = self.max_drawdown
@@ -246,7 +347,7 @@ class ValidationAirgapEngine:
         )
 
         try:
-            result = self.evaluate_candidate_weights(weights_path, model_type=model_type)
+            result = self.evaluate_candidate_weights(weights_path, model_type=model_type, symbol=symbol)
         finally:
             self.min_sharpe = original_sharpe
             self.max_drawdown = original_dd

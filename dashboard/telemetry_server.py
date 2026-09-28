@@ -328,6 +328,73 @@ def api_kill_switch():
     return jsonify({"kill_switch_engaged": engage})
 
 
+# --------------------------------------------------------------- control APIs
+#
+# FULL-DESIGN-REVIEW ADDITION: these follow the exact same principle
+# api_kill_switch() above already established -- this dashboard process never
+# executes a control action itself, it only writes a durable command file that
+# whichever process is actually running the trading loop polls and acts on
+# (see execution/command_channel.py, and scripts/genesis_prime.py's run_live()
+# for where it's polled). This keeps the dashboard and the trading loop as
+# fully independent processes: restarting either one never affects the other,
+# and a command that arrives while the trading loop happens to be down simply
+# waits in the commands/ directory until it comes back up, rather than being
+# lost or requiring the dashboard to hold a live reference to it.
+#
+# A separate FastAPI backend (execution/control_panel_api.py) was previously
+# built for these same actions, holding an in-process reference to a live
+# LivePaperInferenceServer/ContinuousTrainer and starting them via
+# asyncio.create_task() inside the API process itself. That was a real design
+# mistake, found during a full-design review: it coupled the control surface
+# to the trading process's lifetime in exactly the way api_kill_switch()
+# above had already deliberately avoided. That file is now deprecated in
+# favor of these routes -- see its own module docstring for the full
+# explanation and the file-based alternative it now also offers.
+from execution.command_channel import issue_command, START_TRADING, STOP_TRADING, START_TRAINING, STOP_TRAINING, RESET_HALT, APPROVE_PROMOTION
+
+
+@app.route("/api/trading/start", methods=["POST"])
+@require_token
+def api_start_trading():
+    issue_command(STATE_DIR, START_TRADING)
+    return jsonify({"ok": True, "command": START_TRADING})
+
+
+@app.route("/api/trading/stop", methods=["POST"])
+@require_token
+def api_stop_trading():
+    issue_command(STATE_DIR, STOP_TRADING)
+    return jsonify({"ok": True, "command": STOP_TRADING})
+
+
+@app.route("/api/training/start", methods=["POST"])
+@require_token
+def api_start_training():
+    issue_command(STATE_DIR, START_TRAINING)
+    return jsonify({"ok": True, "command": START_TRAINING})
+
+
+@app.route("/api/training/stop", methods=["POST"])
+@require_token
+def api_stop_training():
+    issue_command(STATE_DIR, STOP_TRAINING)
+    return jsonify({"ok": True, "command": STOP_TRAINING})
+
+
+@app.route("/api/risk/halt/reset", methods=["POST"])
+@require_token
+def api_reset_halt():
+    issue_command(STATE_DIR, RESET_HALT)
+    return jsonify({"ok": True, "command": RESET_HALT})
+
+
+@app.route("/api/promotions/<int:agent_id>/approve", methods=["POST"])
+@require_token
+def api_approve_promotion(agent_id: int):
+    issue_command(STATE_DIR, APPROVE_PROMOTION, {"agent_id": agent_id})
+    return jsonify({"ok": True, "command": APPROVE_PROMOTION, "agent_id": agent_id})
+
+
 if __name__ == "__main__":
     host = os.environ.get("DASHBOARD_HOST", "127.0.0.1")
     port = int(os.environ.get("DASHBOARD_PORT", "5000"))

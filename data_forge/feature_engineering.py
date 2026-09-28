@@ -120,7 +120,10 @@ class TradeFlowPhysics:
 
     def _process_with_cudf(self, file_path: str, output_path: str, volume_bucket_size: float = 10.0, date: str = None):
         logger.debug(f"Loading {file_path} into cuDF...")
-        df = cudf.read_csv(file_path, names=["agg_trade_id", "price", "quantity", "first_trade_id", "last_trade_id", "transact_time", "is_buyer_maker", "is_best_match"])
+        if file_path.endswith(".parquet"):
+            df = cudf.read_parquet(file_path)
+        else:
+            df = cudf.read_csv(file_path, names=["agg_trade_id", "price", "quantity", "first_trade_id", "last_trade_id", "transact_time", "is_buyer_maker", "is_best_match"])
 
         prev_remainder = self._get_previous_remainder(date)
 
@@ -209,9 +212,25 @@ class TradeFlowPhysics:
         os.replace(tmp_path, output_path)
         logger.info(f"Saved cuDF processed features to {output_path}")
 
+    def _load_agg_trades(self, file_path: str) -> "pl.DataFrame":
+        """Loads a raw aggTrades file regardless of on-disk format.
+
+        micro_ingest.py converts every downloaded aggTrades file to Parquet immediately
+        (and deletes the source CSV), so the normal case here is Parquet. The CSV branch
+        only exists for the rare fallback where Polars was unavailable at ingest time and
+        the raw CSV was kept as-is (see BinanceVisionIngest._convert_csv_to_parquet).
+        """
+        if file_path.endswith(".parquet"):
+            return pl.read_parquet(file_path)
+        return pl.read_csv(
+            file_path,
+            has_header=False,
+            new_columns=["agg_trade_id", "price", "quantity", "first_trade_id", "last_trade_id", "transact_time", "is_buyer_maker", "is_best_match"],
+        )
+
     def _process_with_polars(self, file_path: str, output_path: str, volume_bucket_size: float = 10.0, date: str = None):
         logger.debug(f"Loading {file_path} into Polars...")
-        df = pl.read_csv(file_path, has_header=False, new_columns=["agg_trade_id", "price", "quantity", "first_trade_id", "last_trade_id", "transact_time", "is_buyer_maker", "is_best_match"])
+        df = self._load_agg_trades(file_path)
 
         prev_remainder = self._get_previous_remainder(date)
 
@@ -339,18 +358,45 @@ class TradeFlowPhysics:
         os.replace(tmp_path, output_path)
         logger.info(f"Saved Polars processed features to {output_path}")
 
+    @staticmethod
+    def _select_aggtrades_file(files: list) -> str:
+        """Deterministic source selection -- NOT glob order, which is
+        OS-dependent, not alphabetical (this was previously assumed to be
+        "arbitrary but stable" and was not; a prior pass claimed this was
+        fixed and verified, but the fix was never actually present in this
+        file -- confirmed by grep before writing this, then fixed for real
+        here with an executable test, see
+        tests/test_feature_engineering_file_selection.py).
+
+        Preference: a genuine Binance-Vision bulk download
+        (micro_ingest.py's `{SYM}-aggTrades-{date}.parquet`) over
+        data_forge/live_trade_bridge.py's bridged live capture
+        (`{symbol}-live-aggTrades-{date}.parquet`, recognizable by the
+        "-live-" segment) when both exist for the same day -- the bulk
+        archive is the authoritative, complete-day source; the live bridge
+        exists specifically for days the bulk archive doesn't have yet (see
+        live_trade_bridge.py's module docstring). Among multiple matches of
+        the same kind, the caller's `sorted()` already makes ties
+        deterministic; this only decides bulk-vs-live when both are present.
+        """
+        non_live = [f for f in files if "-live-" not in os.path.basename(f)]
+        return non_live[0] if non_live else files[0]
+
     def process_daily_file(self, date: str):
         date_path = date.replace("-", "/")
-        # Search for both raw CSV and pre-converted Parquet files
+        # Search for both raw CSV and pre-converted Parquet files. sorted()
+        # on each glob result makes same-kind ties deterministic (glob.glob's
+        # own order is OS-dependent, not alphabetical -- do not remove this).
         search_csv = os.path.join(self.raw_dir, date_path, "*.csv")
         search_pq = os.path.join(self.raw_dir, date_path, "*.parquet")
-        files = glob.glob(search_csv) + glob.glob(search_pq)
+        # Prefer Parquet (the normal ingested format) over any leftover raw CSV.
+        files = sorted(glob.glob(search_pq)) + sorted(glob.glob(search_csv))
 
         if not files:
             logger.warning(f"No aggTrades found for {self.symbol} on {date} in {self.raw_dir}")
             return
 
-        file_path = files[0]
+        file_path = self._select_aggtrades_file(files)
         out_dir = os.path.join(self.processed_dir, date_path)
         os.makedirs(out_dir, exist_ok=True)
         out_path = os.path.join(out_dir, "physics.parquet")

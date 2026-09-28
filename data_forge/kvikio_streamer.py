@@ -45,7 +45,7 @@ try:
 except ImportError:
     KVIKIO_AVAILABLE = False
 
-from data_forge.schema import TradeJackPhysicsSchema
+from data_forge.schema import TradeJackPhysicsSchema, LOBDepthSchema, RawTradeSchema
 
 class KvikIODataForge:
     """
@@ -141,13 +141,41 @@ class KvikIODataForge:
         except Exception as e:
             logger.error(f"Failed to save FIFO tail for {container_name}: {e}")
 
+    @staticmethod
+    def _select_schema(file_path: str):
+        """Picks the correct schema for a partition based on which pipeline produced it.
+
+        Live L2 depth (lob_collector.py output, under data_store/live/...) and any file whose
+        directory/name says "depth" validates against LOBDepthSchema (bid/ask tiers). Raw
+        aggTrades dumps (data_store/raw/<symbol>/aggTrades/...) validate against RawTradeSchema.
+        Everything else is assumed to be feature_engineering.py output and validates against
+        TradeJackPhysicsSchema (OHLC + OFI/VPIN/Kyle's Lambda columns). Validating live depth
+        files against the physics schema was the root cause of all live L2 data being quarantined.
+
+        MERGE NOTE: an earlier version of this fix matched by path-tier only ("live" as a path
+        component), which missed already-relocated files like data_store/quarantine/depth_13.parquet
+        (no "live" segment left in the path, but still a depth file by name). A separately-developed
+        version matched by lowercased path/basename substring ("/live/" or "depth" in the filename),
+        which catches that case but had silently dropped RawTradeSchema routing entirely -- meaning
+        raw aggTrades dumps (which have neither a depth-like name nor an open_price column) would
+        fall through to TradeJackPhysicsSchema and quarantine too. This merges both: substring
+        matching for robustness to relocated/renamed files, plus the raw-aggTrades branch restored.
+        """
+        normalized = file_path.replace("\\", "/").lower()
+        if "/live/" in normalized or "depth" in os.path.basename(normalized):
+            return LOBDepthSchema
+        if "/raw/" in normalized and "aggtrades" in normalized:
+            return RawTradeSchema
+        return TradeJackPhysicsSchema
+
     def _validate_schema_lazy(self, file_path: str) -> bool:
         """Uses CPU-side Polars LazyFrame to validate schema before hitting GPU VRAM."""
         if not POLARS_AVAILABLE or not file_path.endswith(".parquet"):
             return True
+        schema_cls = self._select_schema(file_path)
         try:
             lazy_df = pl.scan_parquet(file_path).head(1000)
-            TradeJackPhysicsSchema.validate(lazy_df.collect())
+            schema_cls.validate(lazy_df.collect())
             return True
         except Exception as e:
             logger.error(f"Schema validation failed for {file_path}. Error: {e}")

@@ -39,6 +39,7 @@ class ContainerLedgerSummary:
     ticks_active: int
     last_hwm_market_timestamp: float
     market_timestamp: float
+    first_market_timestamp: float = 0.0
     tier: int = 2
     oom_penalty_active: bool = False
     oom_lock_until: float = 0.0
@@ -187,7 +188,7 @@ class WardenHypervisor:
                 tick_id INTEGER PRIMARY KEY, timestamp REAL, cash REAL, equity REAL, 
                 peak_equity REAL, max_drawdown REAL, lifetime_sharpe REAL, 
                 rolling_sortino REAL, ticks_active INTEGER, last_hwm_market_timestamp REAL,
-                market_timestamp REAL
+                market_timestamp REAL, first_market_timestamp REAL
             )
         """)
         conn.execute("""
@@ -210,13 +211,23 @@ class WardenHypervisor:
                 equity REAL, reason TEXT
             )
         """)
+        # REVIEW FIX (starvation-logic audit): this is a SECOND, independently
+        # maintained copy of portfolio_tracker.py's schema (found only by running
+        # the existing test suite, not by reading -- the two had silently drifted
+        # apart before this fix even existed, which is exactly the risk of
+        # duplicated schema definitions). Same migration reasoning applies: an
+        # existing ledger created before this fix needs the column added.
+        try:
+            conn.execute("ALTER TABLE portfolio_state ADD COLUMN first_market_timestamp REAL DEFAULT 0.0")
+        except sqlite3.OperationalError:
+            pass
         cursor = conn.cursor()
         cursor.execute("SELECT COUNT(*) FROM portfolio_state")
         if cursor.fetchone()[0] == 0:
             cursor.execute("""
                 INSERT INTO portfolio_state 
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (0, time.time(), initial_cash, initial_cash, initial_cash, 0.0, 0.0, 0.0, 0, 0.0, 0.0))
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (0, time.time(), initial_cash, initial_cash, initial_cash, 0.0, 0.0, 0.0, 0, 0.0, 0.0, 0.0))
         conn.commit()
         conn.close()
         return db_path
@@ -230,7 +241,8 @@ class WardenHypervisor:
             cursor = conn.cursor()
             cursor.execute("""
                 SELECT cash, equity, peak_equity, max_drawdown, lifetime_sharpe,
-                       rolling_sortino, ticks_active, last_hwm_market_timestamp, market_timestamp
+                       rolling_sortino, ticks_active, last_hwm_market_timestamp, market_timestamp,
+                       first_market_timestamp
                 FROM portfolio_state ORDER BY tick_id DESC LIMIT 1
             """)
             row = cursor.fetchone()
@@ -242,7 +254,7 @@ class WardenHypervisor:
             if not row:
                 return None
             
-            cash, equity, peak_eq, max_dd, sharpe, sortino, t_active, hwm_ts, mk_ts = row
+            cash, equity, peak_eq, max_dd, sharpe, sortino, t_active, hwm_ts, mk_ts, first_mk_ts = row
             oom_lock = float(oom_row[0]) if oom_row else 0.0
             
             summary = ContainerLedgerSummary(
@@ -257,6 +269,7 @@ class WardenHypervisor:
                 ticks_active=int(t_active) if t_active is not None else 0,
                 last_hwm_market_timestamp=float(hwm_ts) if hwm_ts is not None else 0.0,
                 market_timestamp=float(mk_ts) if mk_ts is not None else 0.0,
+                first_market_timestamp=float(first_mk_ts) if first_mk_ts is not None else 0.0,
                 oom_lock_until=oom_lock,
                 oom_penalty_active=bool(oom_lock > time.time())
             )
@@ -267,6 +280,39 @@ class WardenHypervisor:
             return None
 
     def apply_survival_tax(self, child_id: int, summary: ContainerLedgerSummary):
+        """
+        Deducts the periodic "cost of staying alive" tax: a log-scaled base component
+        plus a stagnation penalty for going too long without a new equity high-water
+        mark.
+
+        REVIEW FIX (starvation-logic audit): the base tax's time proxy used to be
+        `simulated_hours = summary.ticks_active / 60.0` -- assuming exactly 60 ticks
+        per hour, i.e. one tick = one real/market minute. Traced this against the
+        actual data: TradeFlowPhysics (data_forge/feature_engineering.py) buckets by
+        VOLUME (`volume_bucket_size`), not by fixed time intervals, and
+        physics/lob_env.py's TradeJackLOBEnv -- the exact env swarm/child_agent.py
+        uses -- increments `ticks_active` once per volume bucket, not once per
+        real/market minute. So one tick can span anywhere from a few seconds (a
+        high-volume regime -- exactly the flash-crash/liquidity-vacuum synthetic
+        scenarios this project trains against) to hours (a quiet market). The old
+        formula would OVER-tax an agent for surviving exactly the volatile
+        conditions it should be rewarded for handling well, and UNDER-tax one that's
+        genuinely sat idle a long real/market time during a quiet period --
+        inverting the tax's own intended incentive in exactly the highest-stakes
+        case. (Note for anyone reviving this legacy path further: the same "1 tick =
+        1 minute" assumption is baked in more deeply via
+        PortfolioAccountingEngine's `ticks_per_year = 365.0 * 1440.0`, which also
+        feeds the lifetime_sharpe/rolling_sortino annualization -- out of scope for
+        this fix, but the same root cause.)
+
+        Fixed by reusing the exact same sound methodology the stagnation-penalty
+        half of this formula already relied on: a REAL market-timestamp delta
+        (`first_market_timestamp`, set once on a child's very first tick -- see
+        physics/portfolio_tracker.py's record_step()) instead of a tick-count proxy.
+        This makes both halves of the formula consistent: genuine elapsed
+        real/market time, regardless of how many volume buckets happened to fill
+        along the way.
+        """
         if not summary.is_alive:
             return
             
@@ -275,7 +321,28 @@ class WardenHypervisor:
         if stagnation_seconds > 14400.0:
             stagnation_penalty = self.beta_stagnation_penalty * ((stagnation_seconds - 14400.0) / 3600.0)
             
-        simulated_hours = summary.ticks_active / 60.0
+        elapsed_market_seconds = max(summary.market_timestamp - summary.first_market_timestamp, 0.0)
+        # DEFENSIVE GUARD, found by testing the ALTER TABLE migration path directly:
+        # a RESUMED child from a pre-fix ledger has ticks_active already > 1, so
+        # record_step()'s `if self.ticks_active == 1` branch -- the only place
+        # first_market_timestamp gets set -- never fires again for it. Migration
+        # backfills the column but can only default it to 0.0 (a real value isn't
+        # recoverable from old data), which would otherwise make this compute
+        # elapsed time since the Unix epoch: billions of seconds, i.e. a
+        # catastrophic phantom tax that would instantly bankrupt every resumed
+        # legacy child. Treat "unknown" as "no base tax this cycle" (stagnation
+        # penalty, which doesn't depend on first_market_timestamp, still applies
+        # normally) rather than silently computing a nonsensical multi-decade tax.
+        if summary.first_market_timestamp <= 0.0:
+            logger.warning(
+                f"Child {child_id}: first_market_timestamp unknown (likely a resumed "
+                f"pre-fix ledger) -- skipping base tax this cycle rather than computing "
+                f"it from the Unix epoch. This self-heals once record_step() is called "
+                f"again with a real value recorded going forward."
+            )
+            simulated_hours = 0.0
+        else:
+            simulated_hours = elapsed_market_seconds / 3600.0
         log_component = self.base_tax_per_hr * (1.0 + self.alpha_tax_scale * math.log(1.0 + simulated_hours))
         
         total_tax = log_component + stagnation_penalty

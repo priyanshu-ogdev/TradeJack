@@ -22,6 +22,7 @@ import sys
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 import time
 import json
+from datetime import datetime, timedelta, timezone
 import sqlite3
 import logging
 import argparse
@@ -56,6 +57,79 @@ from execution.paper_exchange import PaperExchange
 from execution.risk_guardian import RiskGuardian, RiskLimits
 
 
+def _check_promotion_gate(weights_path: str) -> None:
+    """
+    PHASE 0 FIX: nothing previously checked whether the checkpoint sitting at
+    `weights_path` (i.e. DEPLOY_CONFIG.frozen_model_path, what every mode --
+    paper, testnet, live -- loads) had actually passed its own validation
+    gate. Verified directly against this repo's own state: the checkpoint at
+    state/deployed/weights_promoted.zip was written by `train_and_promote.py
+    --force` with promotion_log.jsonl recording `airgap_passed: false,
+    avg_sharpe: -0.073` after only 256 training timesteps (one line in
+    state/training_logs/progress.csv) -- a rejected smoke-test checkpoint,
+    force-promoted anyway, silently loaded as "the live model" by every mode.
+    `--force` is a legitimate, documented human override for iterating on the
+    pipeline -- the bug is that nothing downstream re-surfaces that this
+    override was used once the checkpoint is actually about to trade. This
+    makes that loud instead of silent: refuses to load a checkpoint whose own
+    most recent promotion record says it failed the gate, unless the
+    operator explicitly acknowledges it via TRADEJACK_ALLOW_FAILED_PROMOTION=1
+    (deliberately not a code-level flag -- an env var so it can't be
+    accidentally left on in a config file that gets reused).
+    """
+    log_path = os.path.join(os.path.dirname(os.path.abspath(weights_path)), "promotion_log.jsonl")
+    if not os.path.exists(log_path):
+        return  # no promotion history alongside this checkpoint -- nothing to gate on
+
+    def _norm(p: str) -> str:
+        # Promotion logs can be written on Windows (backslash separators) and
+        # read back on Linux (or vice versa) -- os.path.normpath alone does
+        # NOT convert '\' to '/' on a non-Windows host, so a naive normpath
+        # comparison silently never matches a Windows-written log entry.
+        # Caught by this fix's own test against this repo's real log file.
+        return os.path.normpath(p.replace("\\", "/"))
+
+    target_norm = _norm(weights_path)
+    last_matching = None
+    try:
+        with open(log_path, "r") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                rec_target = rec.get("target_path", "")
+                if _norm(rec_target) == target_norm:
+                    last_matching = rec  # jsonl is append-only chronological; last match wins
+    except Exception as e:
+        logger.warning(f"Could not read promotion log at {log_path}: {e}")
+        return
+
+    if last_matching is not None and last_matching.get("airgap_passed") is False:
+        if os.environ.get("TRADEJACK_ALLOW_FAILED_PROMOTION") == "1":
+            logger.critical(
+                f"LOADING A CHECKPOINT THAT FAILED VALIDATION: {weights_path} "
+                f"(avg_sharpe={last_matching.get('avg_sharpe')}, "
+                f"max_drawdown={last_matching.get('max_drawdown')}) -- proceeding "
+                f"ONLY because TRADEJACK_ALLOW_FAILED_PROMOTION=1 is set. This model "
+                f"lost the statistical validation the pipeline exists to enforce."
+            )
+            return
+        raise RuntimeError(
+            f"Refusing to load '{weights_path}': its own promotion record shows "
+            f"airgap_passed=False (avg_sharpe={last_matching.get('avg_sharpe')}, "
+            f"max_drawdown={last_matching.get('max_drawdown')}). This checkpoint was "
+            f"force-promoted despite failing validation and should not be trusted for "
+            f"paper, testnet, or live trading. Retrain and let it pass the gate "
+            f"normally, or set TRADEJACK_ALLOW_FAILED_PROMOTION=1 if you specifically "
+            f"intend to run this known-bad checkpoint anyway (e.g. to test the "
+            f"pipeline itself)."
+        )
+
+
 def load_frozen_model(weights_path: str, model_name: str = "PPO-DilatedCNN", input_dim: int = 5) -> Any:
     """
     Loads frozen weights for live paper inference.
@@ -65,6 +139,9 @@ def load_frozen_model(weights_path: str, model_name: str = "PPO-DilatedCNN", inp
       3. Rule-based baselines (Momentum-Baseline, BuyAndHold-Baseline)
       4. Safe fallback if promoted checkpoint is not yet generated
     """
+    if weights_path:
+        _check_promotion_gate(weights_path)
+
     card = REGISTRY.get_model_card(model_name)
     algo_class = card.algo_class if card else "PPO"
 
@@ -112,6 +189,81 @@ def load_frozen_model(weights_path: str, model_name: str = "PPO-DilatedCNN", inp
     return MomentumBaseline()
 
 
+def _testnet_gate_path(state_dir: str) -> str:
+    return os.path.join(state_dir, "testnet_first_session.json")
+
+
+def _enforce_testnet_gate(exchange_mode: str, state_dir: str) -> None:
+    """
+    PHASE 1 FIX: `DeploymentConfig.min_weeks_testnet_before_live` used to be asserted
+    at construction (must be >= 1) and referenced only in comments -- nothing measured
+    elapsed testnet time or blocked `exchange_mode="live"` if it hadn't been met. It
+    was a documentation convention for the human operator, not a software gate, despite
+    the field's name implying otherwise. This makes it real:
+
+      - The first time this server runs with exchange_mode="testnet", it records that
+        moment (UTC) to `{state_dir}/testnet_first_session.json`. Repeat testnet runs
+        do not reset this -- the clock starts on first testnet use, not last.
+      - Before constructing a REAL exchange_mode="live" connection, it checks that at
+        least `DEPLOY_CONFIG.min_weeks_testnet_before_live` weeks have elapsed since
+        that first recorded testnet session. No recorded testnet history at all is
+        treated the same as "not enough" -- refused, not silently allowed.
+      - `TRADEJACK_SKIP_TESTNET_GATE=1` overrides it, for the same reason
+        TRADEJACK_ALLOW_FAILED_PROMOTION exists: an operator can always choose to
+        proceed anyway, but the default is refuse-and-explain, not silently permit.
+
+    Deliberately per-state_dir, not global: different accounts/symbols using different
+    state_dirs each need their own testnet track record before going live independently.
+    """
+    gate_path = _testnet_gate_path(state_dir)
+
+    if exchange_mode == "testnet":
+        if not os.path.exists(gate_path):
+            os.makedirs(state_dir, exist_ok=True)
+            payload = {"first_testnet_utc": datetime.now(timezone.utc).isoformat()}
+            with open(gate_path, "w") as f:
+                json.dump(payload, f)
+            logger.info(f"Recorded first testnet session at {payload['first_testnet_utc']} -> {gate_path}")
+        return
+
+    if exchange_mode != "live":
+        return  # paper mode: nothing to gate
+
+    min_weeks = getattr(DEPLOY_CONFIG, "min_weeks_testnet_before_live", 2)
+    required = timedelta(weeks=min_weeks)
+
+    if os.environ.get("TRADEJACK_SKIP_TESTNET_GATE") == "1":
+        logger.critical(
+            "TESTNET GATE BYPASSED via TRADEJACK_SKIP_TESTNET_GATE=1 -- proceeding to "
+            "exchange_mode='live' regardless of recorded testnet history. This was the "
+            "one thing on the upgrade plan explicitly stated as 'cannot be shortcut with "
+            "more code' -- bypassing it is an operator decision, not a software one."
+        )
+        return
+
+    if not os.path.exists(gate_path):
+        raise RuntimeError(
+            f"Refusing to start exchange_mode='live': no testnet session has ever been "
+            f"recorded at '{gate_path}'. Run with exchange_mode='testnet' first for at "
+            f"least {min_weeks} week(s) before going live, or set "
+            f"TRADEJACK_SKIP_TESTNET_GATE=1 if you specifically intend to skip this."
+        )
+
+    with open(gate_path, "r") as f:
+        recorded = json.load(f)
+    first_testnet = datetime.fromisoformat(recorded["first_testnet_utc"])
+    elapsed = datetime.now(timezone.utc) - first_testnet
+    if elapsed < required:
+        remaining = required - elapsed
+        raise RuntimeError(
+            f"Refusing to start exchange_mode='live': only {elapsed.days} day(s) of "
+            f"testnet history recorded (first session {recorded['first_testnet_utc']}), "
+            f"{min_weeks} week(s) required -- {remaining.days} day(s) remaining. Set "
+            f"TRADEJACK_SKIP_TESTNET_GATE=1 if you specifically intend to skip this."
+        )
+    logger.info(f"Testnet gate satisfied: {elapsed.days} day(s) of history since {recorded['first_testnet_utc']}.")
+
+
 class LivePaperInferenceServer:
     def __init__(
         self,
@@ -127,6 +279,9 @@ class LivePaperInferenceServer:
         decision_interval_ticks: int = 1,
         risk_limits_override: Optional[Dict[str, Any]] = None,
         exchange_mode: Optional[str] = None,
+        use_composition_layer: bool = False,
+        predictor: Optional[Any] = None,
+        toxicity_symbol: Optional[str] = None,
     ):
         """
         owns_feed: True (default) means this server opens its own live
@@ -151,6 +306,27 @@ class LivePaperInferenceServer:
             calmer decision cadence without needing a second feed or a
             different feature pipeline — it sees every update (so its
             features stay current) but only acts periodically.
+
+        use_composition_layer: False (default) preserves the exact prior
+            behavior — the RL model's raw action, clipped to [-1, 1], goes
+            straight to the risk check and the exchange, unchanged. True
+            routes the RL action through execution.live_composer's
+            LiveOrderComposer first: an optional predictor's confirmation/
+            disagreement, a risk-budget throttle, a toxicity throttle, and a
+            loss-streak throttle all get to scale (never redirect) the size
+            before it's submitted. See _maybe_act()'s composition block for
+            exactly how the two systems' different units (fraction-of-equity
+            vs. asset-quantity) are reconciled, and docs/COMPOSITION_LAYER.md
+            for the design.
+        predictor: an optional fitted `data_forge.predictor.SignalPredictor`.
+            Only consulted when use_composition_layer=True. None is a fully
+            valid, safe choice — the composer's "unconfirmed" bucket handles
+            "no predictor" the same way it handles "predictor says flat" or
+            "predictor call failed": a flat multiplier, not a crash and not a
+            veto.
+        toxicity_symbol: only consulted when use_composition_layer=True — see
+            LiveOrderComposer's own docstring for its auto-load/caching
+            behavior. None (default) disables the toxicity throttle entirely.
         """
         self.symbol = symbol
         self.seq_len = seq_len
@@ -158,6 +334,27 @@ class LivePaperInferenceServer:
         self.updates_since_last_decision = 0
         self.decision_interval_ticks = max(1, decision_interval_ticks)
         self.obs_buffer: Deque[np.ndarray] = deque(maxlen=seq_len)
+        # TRAIN/SERVE SKEW FIX (automatic trading logic review): _think() used to
+        # normalize its observation with a FRESH mean/std computed only from
+        # whatever's currently in obs_buffer -- but physics/lob_env.py's
+        # TradeJackLOBEnv (what the deployed model was actually TRAINED against)
+        # normalizes using a slowly-evolving EWMA of mean/variance
+        # (alpha=0.01, updated once per raw env step -- see _update_ema() there),
+        # not a fresh per-window recompute. These are fundamentally different
+        # normalizations: a per-window recompute re-centers every decision to
+        # zero-mean over just the recent window, silently discarding exactly the
+        # kind of longer-horizon drift/trend-relative-to-baseline and
+        # volatility-regime information the EWMA baseline was designed to
+        # preserve -- meaning the deployed model would have been receiving
+        # inputs scaled completely differently from what it was trained on,
+        # regardless of how good the training itself was. Fixed by maintaining
+        # the identical EWMA here, updated at the identical cadence (once per
+        # raw tick in _on_update(), not once per decision in _think() --
+        # decision_interval_ticks can make those very different frequencies for
+        # a slower sleeve, which would have been a SECOND, different skew).
+        # Initial values match TradeJackLOBEnv.reset()'s exactly (zeros/ones).
+        self.obs_mean = np.zeros(5, dtype=np.float32)
+        self.obs_var = np.ones(5, dtype=np.float32)
 
         self.model_name = model_name or DEPLOY_CONFIG.model_name
         self.is_running = False
@@ -184,6 +381,7 @@ class LivePaperInferenceServer:
                 symbol=symbol, initial_cash=initial_cash, state_dir=state_dir, account_id=account_id
             )
         else:
+            _enforce_testnet_gate(self.exchange_mode, state_dir)
             from execution.exchange_adapter import BinanceSpotAdapter
             from execution.live_exchange_bridge import LiveExchangeBridge
             logger.warning(
@@ -206,7 +404,24 @@ class LivePaperInferenceServer:
             kill_switch_path=os.path.join(state_dir, "KILL_SWITCH"),
         )
         limits_kwargs.update(risk_limits_override or {})
-        self.risk = RiskGuardian(RiskLimits(**limits_kwargs))
+        # Pass the real starting equity explicitly where it's actually known
+        # at construction time (paper mode: PaperExchange.initial_cash is
+        # exact). In live/testnet mode LiveExchangeBridge.initial_cash is
+        # still 0.0 here (unset until its first background reconciliation
+        # completes), so leave it None -- RiskGuardian's own lazy-capture
+        # logic (_reset_daily_if_needed) picks up the true baseline from the
+        # first real `equity` value passed into check() instead of trusting
+        # a number that hasn't been fetched from the exchange yet.
+        known_starting_equity = self.exchange.initial_cash if self.exchange_mode == "paper" else None
+        self.risk = RiskGuardian(RiskLimits(**limits_kwargs), starting_equity=known_starting_equity)
+
+        self.use_composition_layer = use_composition_layer
+        self.predictor = predictor
+        self.composer: Optional[Any] = None
+        if use_composition_layer:
+            from execution.live_composer import LiveOrderComposer
+
+            self.composer = LiveOrderComposer(risk_guardian=self.risk, toxicity_symbol=toxicity_symbol)
 
         self.owns_feed = owns_feed
         self.use_synthetic_feed = use_synthetic_feed
@@ -234,12 +449,22 @@ class LivePaperInferenceServer:
     @classmethod
     def from_config(cls, cfg: Any):
         """Construct LivePaperInferenceServer from DeploymentConfig."""
+        # PHASE 0 FIX: this used to derive use_synthetic_feed from
+        # exchange_mode == "paper" -- meaning genesis_prime.py's documented
+        # `--mode paper` entrypoint (paper being the default and the
+        # recommended way to evaluate a model before risking anything) ran
+        # against SyntheticReplayFeed's random walk, never real prices, by
+        # construction. Any Sharpe/drawdown/win-rate evidence gathered that
+        # way was evaluating the model against noise, not the market. These
+        # are genuinely independent choices -- exchange_mode picks where
+        # ORDERS go, use_synthetic_feed should pick where PRICES come from --
+        # and are now read as two separate config fields accordingly.
         server = cls(
             symbol=getattr(cfg, "symbol", "BTC-USDT"),
             weights_path=getattr(cfg, "frozen_model_path", None),
             model_name=getattr(cfg, "model_name", "PPO-DilatedCNN"),
             initial_cash=getattr(cfg, "starting_capital", 100.0),
-            use_synthetic_feed=getattr(cfg, "exchange_mode", "paper") == "paper",
+            use_synthetic_feed=getattr(cfg, "use_synthetic_feed", False),
         )
         return server
 
@@ -338,9 +563,12 @@ class LivePaperInferenceServer:
             model = self.model  # local reference: safe even if hot_swap_model() reassigns self.model mid-call
 
         seq = np.stack(list(self.obs_buffer), axis=0)  # (seq_len, 5)
-        mean = seq.mean(axis=0)
-        std = seq.std(axis=0) + 1e-8
-        norm = ((seq - mean) / std).astype(np.float32)
+        # Uses the persistent EWMA (self.obs_mean/self.obs_var, updated once per raw
+        # tick in _on_update -> _update_obs_ema) instead of a fresh per-window
+        # mean/std -- see that method's docstring and self.obs_mean's declaration
+        # for the train/serve skew this fixes. Formula matches
+        # TradeJackLOBEnv._get_observation() exactly: (seq - mean) / (sqrt(var) + eps).
+        norm = ((seq - self.obs_mean) / (np.sqrt(self.obs_var) + 1e-8)).astype(np.float32)
 
         # Standard Gymnasium observation dict expected by SB3 & Baselines
         port_state = np.array([
@@ -422,14 +650,83 @@ class LivePaperInferenceServer:
                 logger.info(f"Tick {self.tick}: decision REJECTED ({reason}), target_frac={target_frac:.3f}")
             return
 
+        final_frac = target_frac
+        if self.composer is not None:
+            # Reconciles two different unit spaces: _think() and submit_target_position()
+            # work in fraction-of-equity space ([-1, 1]); LiveOrderComposer/SignalComposer
+            # work in asset-quantity space (base_qty, so its internal risk_check_fn can
+            # validate the actual proposed order cost). The conversion below derives
+            # base_qty as "the quantity RL's raw target_frac would imply at current
+            # equity/price", then converts the composed result back the same way --
+            # this is the exact fraction<->quantity round-trip, not an approximation:
+            #   base_qty = |target_frac| * equity / price
+            #   proposed_qty = base_qty * intent.size_fraction   (done inside compose())
+            #   => final_frac = intent.direction * |target_frac| * intent.size_fraction
+            # is algebraically final_frac = proposed_qty * price / equity, i.e. the
+            # actual composed order re-expressed as a fraction of equity, sign included.
+            equity = self.exchange.accounting.equity
+            if equity <= 0 or mid <= 0:
+                logger.warning(f"Tick {self.tick}: equity/price non-positive (equity={equity}, price={mid}) "
+                                f"-- skipping composition this tick, no order.")
+                return
+
+            base_qty = abs(target_frac) * equity / mid
+            # Raw (pre-z-score) feature history -- self.obs_buffer already stores
+            # StreamingFeatureEngine's physics-schema rows (close_price/volume/ofi/
+            # vpin_50/kyles_lambda-shaped) unmodified; the z-score normalization in
+            # _think() is a temporary copy made only for the RL model's input, so this
+            # is the same feature space feature_engineering.py's physics table uses,
+            # not the RL-specific normalized view.
+            feature_window = np.stack(list(self.obs_buffer), axis=0)
+
+            intent = self.composer.compose_order(
+                rl_action=target_frac,
+                base_qty=base_qty,
+                price=mid,
+                predictor=self.predictor,
+                feature_window=feature_window,
+            )
+
+            if intent.bucket != "flat_rl" and intent.direction == 0:
+                # Composition suppressed a nonzero RL intent entirely (predictor_locked,
+                # risk_vetoed, or a throttle stack that scaled size to ~0) -- this means
+                # "don't place the trade RL wanted", not "close whatever is currently
+                # open". Explicitly skip submission rather than calling
+                # submit_target_position(0.0), which would force-flatten an existing
+                # position based on a decision that was never about the existing
+                # position in the first place.
+                logger.info(f"Tick {self.tick}: composition suppressed order [{intent.bucket}] {intent.reason}")
+                return
+
+            final_frac = float(np.clip(intent.direction * abs(target_frac) * intent.size_fraction, -1.0, 1.0))
+            if intent.bucket not in ("flat_rl",):
+                logger.info(
+                    f"Tick {self.tick}: composed [{intent.bucket}] raw_target={target_frac:.3f} -> "
+                    f"final={final_frac:.3f} (risk_budget={intent.risk_budget_scalar:.2f}, "
+                    f"toxicity={intent.toxicity_scalar:.2f}, performance={intent.performance_scalar:.2f}) "
+                    f"{intent.reason}"
+                )
+
         self.risk.record_order_submitted(self.tick)
-        result = await self.exchange.submit_target_position(target_frac)
+        result = await self.exchange.submit_target_position(final_frac)
         if result.filled_qty != 0.0 or result.rejected_reason:
             logger.info(
-                f"Tick {self.tick}: target={target_frac:.3f} filled={result.filled_qty:.6f} "
+                f"Tick {self.tick}: target={final_frac:.3f} filled={result.filled_qty:.6f} "
                 f"@ {result.avg_price:.2f} fee={result.fee_paid:.4f} latency={result.latency_sec*1000:.0f}ms "
                 f"reason={result.rejected_reason} equity=${self.exchange.accounting.equity:.4f}"
             )
+
+    def _update_obs_ema(self) -> None:
+        """Mirrors physics/lob_env.py's TradeJackLOBEnv._update_ema() exactly (same
+        alpha=0.01, same batch-mean/batch-var-over-current-window formula) -- see
+        the train/serve skew fix note on self.obs_mean's declaration for why this
+        must match precisely, not approximately."""
+        seq = np.stack(list(self.obs_buffer), axis=0)
+        alpha = 0.01
+        batch_mean = np.mean(seq, axis=0)
+        batch_var = np.var(seq, axis=0)
+        self.obs_mean = (1 - alpha) * self.obs_mean + alpha * batch_mean
+        self.obs_var = (1 - alpha) * self.obs_var + alpha * batch_var
 
     async def _on_update(self, kind: str, payload: Dict[str, Any]):
         if kind == "depth":
@@ -437,6 +734,10 @@ class LivePaperInferenceServer:
             feat = self.feature_engine.on_depth(payload)
             if feat is not None:
                 self.obs_buffer.append(feat)
+                # Updated here, once per raw tick -- matching TradeJackLOBEnv's
+                # once-per-env-step cadence exactly, regardless of
+                # decision_interval_ticks (see the fix note above).
+                self._update_obs_ema()
                 await self._maybe_act()
         elif kind == "trade":
             self.feature_engine.on_trade(payload)

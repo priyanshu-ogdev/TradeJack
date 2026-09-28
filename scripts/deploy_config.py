@@ -29,6 +29,15 @@ class DeploymentConfig:
     # live: BinanceSpotAdapter(testnet=False) — requires testnet evidence
     exchange_mode: str = "paper"
 
+    # Market-data feed used to drive decisions. Independent of exchange_mode
+    # on purpose: exchange_mode controls where ORDERS go (paper wallet vs a
+    # real exchange), this controls where PRICES come from. Defaults to real
+    # market data (BinanceLiveDepthFeed) even in paper mode, so "paper
+    # trading" evidence reflects actual market conditions rather than a
+    # random walk. Set True only for pure logic/plumbing tests that
+    # shouldn't depend on network access to Binance's public feed.
+    use_synthetic_feed: bool = False
+
     # API keys loaded from env vars (never stored in code)
     api_key_env_var: str = "BINANCE_API_KEY"
     api_secret_env_var: str = "BINANCE_API_SECRET"
@@ -41,6 +50,14 @@ class DeploymentConfig:
     connection_loss_flatten_sec: int = 60
     order_reconciliation_interval_sec: int = 60
     monitoring_out_of_band_days: int = 3
+
+    # PHASE 2: a champion should not get promoted if the training/evaluation data
+    # it was measured against is stale relative to current market conditions -- see
+    # escrow/validation_airgap.py's data-freshness check. Reuses this same 3-day
+    # default rather than inventing an unrelated number, since it's the same
+    # underlying concept ("how long since we've genuinely seen this system's data
+    # pipeline produce something current") as monitoring_out_of_band_days above.
+    max_training_data_staleness_days: int = 3
 
     # ── Position Throttle (replaces live burn) ──
     # Scales max_position_fraction based on rolling Sortino ratio

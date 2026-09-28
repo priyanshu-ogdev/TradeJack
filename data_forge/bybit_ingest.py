@@ -1,15 +1,31 @@
 """
-Bybit Free Historical L2 Order Book Ingest Engine.
-Downloads free daily L2 depth snapshots from Bybit's public repository.
-Provides years of multi-level order book data for training RL agents on
-liquidity exhaustion, spoofing detection, and real LOB friction physics.
+Bybit Free Historical Trades Ingest Engine.
 
-Data Source: https://public.bybit.com/orderbook/{SYMBOL}/
-Format: GZIP CSV → ZSTD-L3 Parquet (direct conversion, no intermediate waste)
+IMPORTANT -- read before changing the URL:
+Bybit's public dump (public.bybit.com) does NOT publish free historical L2 order book
+depth. The only free daily bulk dump is executed TRADE ticks, served under
+`spot/{SYMBOL}/` with columns:
+    timestamp, symbol, side, size, price, tickDirection, trdMatchID,
+    grossValue, homeNotional, foreignNotional
+An earlier version of this module pointed at a non-existent `orderbook/{SYMBOL}/`
+path (404 on every request) and, worse, tried to synthesize fake L2 depth by
+grouping trade ticks by timestamp and pivoting them into bid_px_N/ask_px_N
+columns. Trade prints are not resting orders -- that synthesis does not produce
+real order book depth and has been removed entirely.
 
-This module is the "Historical Training" half of the hybrid L2 strategy:
-  - Historical: Bybit L2 dumps (this module)
-  - Live: Binance WebSocket collector (lob_collector.py)
+What this module now does: downloads the REAL Bybit trade-tick dump and converts
+it to ZSTD Parquet under `raw/{symbol}/bybit_trades/`, validated against
+BybitTradeSchema. This is a second, independent trade-tick source (alongside
+Binance Vision aggTrades) -- useful for cross-exchange trade-flow features and
+liquidity/venue comparison, NOT a source of L2 depth.
+
+For real, free L2 order book depth, the only source in this project is
+lob_collector.py (live Binance WebSocket depth@100ms). There is currently no
+free bulk *historical* L2 depth source wired into data_forge -- see
+docs/DATA_FORGE.md, section "Known Data Gaps", for options if that's needed.
+
+Data Source: https://public.bybit.com/spot/{SYMBOL}/{SYMBOL}_{DATE}.csv.gz
+Format: GZIP CSV -> ZSTD-L3 Parquet (direct conversion, no intermediate waste)
 """
 
 import os
@@ -18,11 +34,10 @@ import gzip
 import aiohttp
 import asyncio
 import logging
-import re
-from datetime import datetime
 from typing import List, Optional
 
 from data_forge.config import config
+from data_forge.schema import BybitTradeSchema
 
 try:
     import polars as pl
@@ -33,15 +48,22 @@ except ImportError:
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] (BybitIngest) %(message)s")
 logger = logging.getLogger("BybitIngest")
 
-# Bybit orderbook CSV columns
-BYBIT_OB_COLUMNS = ["timestamp", "side", "price", "size"]
+# Real Bybit public trade-tick CSV columns (public.bybit.com/spot/{SYMBOL}/)
+# NOTE: column list carried over from the derivatives "trading/" dump's known
+# schema. The spot dump's exact columns have not been empirically verified
+# against a real download in this sandbox (no network access) -- confirm
+# against one real file before trusting this list.
+BYBIT_TRADE_COLUMNS = [
+    "timestamp", "symbol", "side", "size", "price",
+    "tickDirection", "trdMatchID", "grossValue", "homeNotional", "foreignNotional",
+]
 
 
-class BybitL2Ingest:
+class BybitTradesIngest:
     """
-    Downloads Bybit's free public historical L2 order book data.
+    Downloads Bybit's free public historical trade-tick dump.
     Converts GZIP CSV dumps to ZSTD-L3 Parquet partitioned by date.
-    Produces schema-compatible depth snapshots for the TradeJack LOB physics engine.
+    This is a trade-flow source (comparable to Binance aggTrades), not L2 depth.
     """
 
     def __init__(self):
@@ -50,12 +72,12 @@ class BybitL2Ingest:
         self._semaphore = asyncio.Semaphore(config.max_concurrent_downloads)
 
     def _get_target_dir(self, symbol: str, date: str) -> str:
-        target_dir = os.path.join(self.store_dir, "raw", symbol, "depth", date.replace("-", "/"))
+        target_dir = os.path.join(self.store_dir, "raw", symbol, "bybit_trades", date.replace("-", "/"))
         os.makedirs(target_dir, exist_ok=True)
         return target_dir
 
     def _bybit_symbol(self, symbol: str) -> str:
-        """Converts TradeJack symbol format to Bybit format (BTC-USDT → BTCUSDT)."""
+        """Converts TradeJack symbol format to Bybit format (BTC-USDT -> BTCUSDT)."""
         return symbol.replace("-", "").upper()
 
     async def _download_with_retry(self, session: aiohttp.ClientSession, url: str) -> Optional[bytes]:
@@ -75,104 +97,84 @@ class BybitL2Ingest:
                 await asyncio.sleep(2 ** attempt)
         return None
 
-    def _convert_orderbook_to_depth_parquet(self, raw_data: bytes, parquet_path: str, is_gzip: bool = True) -> bool:
-        """
-        Converts raw Bybit orderbook CSV/GZIP data into a depth-snapshot Parquet file.
-        Pivots the side/price/size rows into bid_px_0..N / ask_px_0..N format
-        compatible with the TradeJack LOB physics engine.
-        """
+    def _convert_trades_to_parquet(self, raw_data: bytes, parquet_path: str) -> bool:
+        """Converts raw Bybit trade-tick GZIP CSV into ZSTD Parquet. Validates the result
+        against BybitTradeSchema before writing."""
         if not POLARS_AVAILABLE:
-            logger.warning("Polars required for Bybit L2 conversion. Skipping.")
+            logger.warning("Polars required for Bybit trades conversion. Skipping.")
             return False
 
         try:
-            if is_gzip:
-                csv_bytes = gzip.decompress(raw_data)
-            else:
-                csv_bytes = raw_data
-
+            csv_bytes = gzip.decompress(raw_data)
             df = pl.read_csv(
                 io.BytesIO(csv_bytes),
                 has_header=True,
-                columns=BYBIT_OB_COLUMNS,
-                dtypes={
+                columns=BYBIT_TRADE_COLUMNS,
+                schema_overrides={
                     "timestamp": pl.Float64,
+                    "symbol": pl.Utf8,
                     "side": pl.Utf8,
-                    "price": pl.Float64,
                     "size": pl.Float64,
-                }
+                    "price": pl.Float64,
+                    "tickDirection": pl.Utf8,
+                    "trdMatchID": pl.Utf8,
+                    "grossValue": pl.Float64,
+                    "homeNotional": pl.Float64,
+                    "foreignNotional": pl.Float64,
+                },
             )
 
             if df.is_empty():
-                logger.warning(f"Empty orderbook data, skipping: {parquet_path}")
+                logger.warning(f"Empty trades data, skipping: {parquet_path}")
                 return False
 
-            # Separate bids and asks
-            bids = df.filter(pl.col("side") == "Buy").sort(["timestamp", "price"], descending=[False, True])
-            asks = df.filter(pl.col("side") == "Sell").sort(["timestamp", "price"], descending=[False, False])
-
-            # Group by timestamp and extract top N levels
-            depth_levels = 8  # Match TradeJack LOB env's 8-tier depth
-
-            def _extract_levels(group_df: pl.DataFrame, prefix: str, num_levels: int) -> pl.DataFrame:
-                """Extracts top N price/size levels per timestamp."""
-                group_df = group_df.with_columns(
-                    pl.col("price").rank("ordinal").over("timestamp").alias("level")
-                )
-                records = []
-                for ts, ts_group in group_df.group_by("timestamp"):
-                    row = {"timestamp": ts[0]}
-                    ts_sorted = ts_group.sort("level")
-                    for i in range(min(num_levels, len(ts_sorted))):
-                        row[f"{prefix}_px_{i}"] = float(ts_sorted["price"][i])
-                        row[f"{prefix}_sz_{i}"] = float(ts_sorted["size"][i])
-                    # Pad missing levels with 0
-                    for i in range(len(ts_sorted), num_levels):
-                        row[f"{prefix}_px_{i}"] = 0.0
-                        row[f"{prefix}_sz_{i}"] = 0.0
-                    records.append(row)
-                return pl.DataFrame(records) if records else pl.DataFrame()
-
-            bid_levels = _extract_levels(bids, "bid", depth_levels)
-            ask_levels = _extract_levels(asks, "ask", depth_levels)
-
-            if bid_levels.is_empty() or ask_levels.is_empty():
-                logger.warning(f"Insufficient bid/ask data for depth conversion: {parquet_path}")
+            try:
+                BybitTradeSchema.validate(df.select(["timestamp", "symbol", "side", "size", "price"]))
+            except Exception as schema_err:
+                logger.error(f"Bybit trades failed schema validation, skipping: {schema_err}")
                 return False
 
-            # Join bids and asks on timestamp
-            depth_df = bid_levels.join(ask_levels, on="timestamp", how="inner")
-            depth_df = depth_df.sort("timestamp")
-
-            depth_df.write_parquet(
+            df = df.sort("timestamp")
+            df.write_parquet(
                 parquet_path,
                 compression=config.compression_codec,
                 compression_level=config.compression_level,
                 row_group_size=config.row_group_size,
             )
-            logger.info(f"Bybit L2 → Parquet ({len(depth_df)} snapshots): {parquet_path}")
+            logger.info(f"Bybit trades -> Parquet ({len(df)} ticks): {parquet_path}")
             return True
 
         except Exception as e:
-            logger.error(f"Bybit L2 conversion failed: {e}")
+            logger.error(f"Bybit trades conversion failed: {e}")
             return False
 
-    async def download_daily_depth(self, symbol: str, date: str) -> str:
+    async def download_daily_trades(self, symbol: str, date: str) -> str:
         """
-        Downloads a single day of L2 orderbook data from Bybit public repository.
-        Bybit stores files as: https://public.bybit.com/orderbook/{SYMBOL}/{SYMBOL}{DATE}.csv.gz
+        Downloads a single day of trade-tick data from Bybit's real public dump.
+        URL layout: https://public.bybit.com/spot/{SYMBOL}/{SYMBOL}_{DATE}.csv.gz
         """
         target_dir = self._get_target_dir(symbol, date)
         bybit_sym = self._bybit_symbol(symbol)
-        parquet_path = os.path.join(target_dir, f"{bybit_sym}-depth-{date}.parquet")
+        parquet_path = os.path.join(target_dir, f"{bybit_sym}-trades-{date}.parquet")
 
         if os.path.exists(parquet_path):
-            logger.debug(f"Bybit depth Parquet exists for {symbol} {date}. Skipping.")
+            logger.debug(f"Bybit trades Parquet exists for {symbol} {date}. Skipping.")
             return parquet_path
 
-        # Bybit naming convention: BTCUSDT2024-01-01.csv.gz
-        gz_filename = f"{bybit_sym}{date}.csv.gz"
-        url = f"{self.base_url}orderbook/{bybit_sym}/{gz_filename}"
+        # BYBIT PATH/FILENAME FIX (verified against an independent Bybit
+        # downloader's documented behavior, since this sandbox has no network
+        # access to check public.bybit.com directly): Bybit's public dump splits
+        # trade data into separate top-level paths by market type -- 'trading/'
+        # for derivatives (no separator in the filename, e.g.
+        # BTCUSD2024-01-01.csv.gz) and 'spot/' for spot pairs (underscore
+        # separator, e.g. BTCUSDT_2024-01-01.csv.gz). This project is spot-only
+        # (see docs/ARCHITECTURE.md), so it must use the 'spot/' path with the
+        # underscore -- a prior version of this fix corrected the fake-depth-
+        # synthesis bug but still pointed at 'trading/' with no separator,
+        # which would 404 or silently pull the wrong market's data for a spot
+        # symbol like BTCUSDT.
+        gz_filename = f"{bybit_sym}_{date}.csv.gz"
+        url = f"{self.base_url}spot/{bybit_sym}/{gz_filename}"
 
         async with self._semaphore:
             async with aiohttp.ClientSession() as session:
@@ -180,32 +182,37 @@ class BybitL2Ingest:
                 if content is None:
                     return ""
 
-                if self._convert_orderbook_to_depth_parquet(content, parquet_path, is_gzip=True):
+                if self._convert_trades_to_parquet(content, parquet_path):
                     return parquet_path
                 return ""
 
     async def ingest_range(self, symbol: str, start_date: str, end_date: str) -> List[str]:
-        """Ingests a date range of L2 depth data with rate-limited concurrency."""
+        """Ingests a date range of Bybit trade ticks with rate-limited concurrency."""
         import pandas as pd
         dates = pd.date_range(start=start_date, end=end_date).strftime("%Y-%m-%d").tolist()
-        tasks = [self.download_daily_depth(symbol, date) for date in dates]
+        tasks = [self.download_daily_trades(symbol, date) for date in dates]
         results = await asyncio.gather(*tasks)
         successful = [r for r in results if r]
-        logger.info(f"Bybit L2 ingest complete for {symbol}. {len(successful)}/{len(dates)} days.")
+        logger.info(f"Bybit trades ingest complete for {symbol}. {len(successful)}/{len(dates)} days.")
         return successful
 
     async def ingest_all_symbols(self, start_date: str, end_date: str) -> dict:
-        """Ingests L2 depth for all configured default symbols."""
+        """Ingests trade ticks for all configured default crypto symbols."""
         results = {}
         for symbol in config.default_symbols:
-            logger.info(f"Starting Bybit L2 depth ingest for {symbol}...")
+            logger.info(f"Starting Bybit trades ingest for {symbol}...")
             results[symbol] = await self.ingest_range(symbol, start_date, end_date)
         return results
 
 
+# Backwards-compatible alias -- old code/tests may still import BybitL2Ingest by name.
+# It is no longer an L2 depth ingestor; it downloads trade ticks. Prefer BybitTradesIngest.
+BybitL2Ingest = BybitTradesIngest
+
+
 if __name__ == "__main__":
     async def main():
-        ingestor = BybitL2Ingest()
+        ingestor = BybitTradesIngest()
         await ingestor.ingest_range("BTC-USDT", "2024-01-01", "2024-01-03")
 
     asyncio.run(main())

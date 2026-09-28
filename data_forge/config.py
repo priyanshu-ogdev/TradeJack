@@ -37,10 +37,22 @@ class ForgeConfig(BaseSettings):
         default="https://api.binance.com",
         description="Binance REST API for order book snapshots"
     )
-    # Bybit Historical L2 (Free public bulk data: order book depth)
+    # Bybit Historical Trades (Free public bulk data: executed trade ticks, NOT L2 depth)
+    # NOTE: Bybit's public dump only publishes executed trades, no L2 depth. For a
+    # SPOT symbol this lives under `spot/{SYMBOL}/{SYMBOL}_{DATE}.csv.gz` (underscore
+    # separator) -- NOT `trading/{SYMBOL}/{SYMBOL}{DATE}.csv.gz` (no separator), which
+    # is the path/filename convention for derivatives, not spot. This project is
+    # spot-only (see docs/ARCHITECTURE.md). Do not point this at "orderbook/" either --
+    # that directory doesn't exist. See bybit_ingest.py for the full explanation.
     bybit_history_base_url: str = Field(
         default="https://public.bybit.com/",
-        description="Base URL for Bybit free historical L2 order book data"
+        description="Base URL for Bybit's free historical spot trades dump (public.bybit.com/spot/)"
+    )
+
+    # Dukascopy (Free public bulk data: FX/CFD/metals tick data, no API key required)
+    dukascopy_base_url: str = Field(
+        default="https://datafeed.dukascopy.com/datafeed/",
+        description="Base URL for Dukascopy's free historical FX tick data (.bi5 hourly files)"
     )
 
     # Qdrant Vector DB
@@ -58,7 +70,11 @@ class ForgeConfig(BaseSettings):
     # ── Multi-Symbol Support ──────────────────────────────────────────
     default_symbols: List[str] = Field(
         default=["BTC-USDT", "ETH-USDT", "SOL-USDT"],
-        description="Default trading symbols for multi-symbol ingest pipelines"
+        description="Default crypto trading symbols for multi-symbol ingest pipelines"
+    )
+    default_forex_pairs: List[str] = Field(
+        default=["EURUSD", "GBPUSD", "USDJPY", "AUDUSD", "USDCHF"],
+        description="Default FX pairs for the Dukascopy forex ingest pipeline (Dukascopy naming, no slash)"
     )
 
     # ── Data Storage ──────────────────────────────────────────────────
