@@ -24,6 +24,29 @@ from typing import Dict, Any, List, Optional
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] (GenesisPrime) %(message)s")
 logger = logging.getLogger("GenesisPrime")
 
+# BUG FOUND BY ACTUALLY RUNNING --mode crucible, not by reading this file:
+# every path below used to be a hardcoded Windows-style literal
+# ("d:/TradeJack/..."). That's a leftover from the original dev machine and
+# is not a valid absolute path on Linux/Mac (no drive-letter concept there) —
+# os.path.join/os.path.abspath silently treat "d:/TradeJack/state" as a
+# RELATIVE path segment and prepend the actual cwd, so on any non-Windows
+# host (i.e. any real DGX/cloud deployment, which is this project's actual
+# target) state silently landed in a path like
+# "<cwd>/d:/TradeJack/state/tournament/..." instead of failing loudly.
+# Confirmed by running `genesis_prime.py --mode crucible` and inspecting
+# where it actually wrote checkpoints. PROJECT_ROOT below is the portable
+# replacement — same layout (state/, data_store/), computed relative to this
+# file instead of assuming a specific OS and drive letter.
+#
+# NOTE: the same "d:/TradeJack/..." literal appears as a default parameter
+# value in ~20 other files across swarm/, warden/, escrow/, physics/, and
+# tests/ (39 occurrences total, checked with grep). Those are lower priority
+# than this file — genesis_prime.py is the one place that PASSES the literal
+# explicitly (not just relies on an unused default), so it's the one that
+# actually broke in a real run. The rest should get the same treatment in a
+# follow-up pass rather than being fixed blind in this one.
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+
 try:
     import torch
     TORCH_AVAILABLE = True
@@ -51,7 +74,7 @@ class GenesisPrimeLauncher:
     Master deployment commander for Project TradeJack.
     """
 
-    def __init__(self, workspace_dir: str = "d:/TradeJack", num_containers: int = 50):
+    def __init__(self, workspace_dir: str = PROJECT_ROOT, num_containers: int = 50):
         self.workspace_dir = os.path.abspath(workspace_dir)
         self.num_containers = num_containers
         self.state_dir = os.path.join(self.workspace_dir, "state")
@@ -241,7 +264,7 @@ if __name__ == "__main__":
 
     if args.legacy:
         # Legacy: Run old 50-container simulation
-        launcher = GenesisPrimeLauncher(workspace_dir="d:/TradeJack", num_containers=args.agents)
+        launcher = GenesisPrimeLauncher(workspace_dir=PROJECT_ROOT, num_containers=args.agents)
         report = asyncio.run(launcher.run_genesis(simulate_locally=True, max_steps=args.max_steps))
         print("Genesis Prime Report:\n", json.dumps(report, indent=2))
 
@@ -250,8 +273,8 @@ if __name__ == "__main__":
         from training.crucible_tournament import CrucibleTournament
         logger.info(f"Starting Crucible Tournament: {args.agents} agents, {args.max_steps} timesteps")
         tournament = CrucibleTournament(
-            data_store_dir="d:/TradeJack/data_store",
-            state_dir="d:/TradeJack/state/tournament",
+            data_store_dir=os.path.join(PROJECT_ROOT, "data_store"),
+            state_dir=os.path.join(PROJECT_ROOT, "state", "tournament"),
             symbol=args.symbol,
         )
         results = tournament.run_tournament(
@@ -277,7 +300,7 @@ if __name__ == "__main__":
 
             # Start continuous trainer in background
             trainer = ContinuousTrainer(
-                data_store_dir="d:/TradeJack/data_store",
+                data_store_dir=os.path.join(PROJECT_ROOT, "data_store"),
                 inference_server=server,
             )
 

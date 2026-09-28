@@ -48,7 +48,7 @@ class WardenHypervisor:
     def __init__(
         self,
         swarm_size: int = 50,
-        state_dir: str = "d:/TradeJack/state",
+        state_dir: str = "state",
         base_tax_per_hr: float = 1.0,
         alpha_tax_scale: float = 0.5,
         beta_stagnation_penalty: float = 0.1,
@@ -508,7 +508,7 @@ class WardenHypervisor:
 
 if __name__ == "__main__":
     logger.info("Initializing Warden Core Hypervisor Standalone Test...")
-    warden = WardenHypervisor(swarm_size=5, state_dir="d:/TradeJack/state")
+    warden = WardenHypervisor(swarm_size=5, state_dir="state")
     for cid in range(5):
         warden.init_child_ledger(cid, initial_cash=10.0)
     warden.run_audit_cycle()

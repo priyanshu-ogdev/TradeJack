@@ -172,7 +172,7 @@ class WardenComputeServer:
     def __init__(
         self,
         port: int = 8080,
-        state_dir: str = "d:/TradeJack/state",
+        state_dir: str = "state",
         swarm_size: int = 50
     ):
         self.port = port

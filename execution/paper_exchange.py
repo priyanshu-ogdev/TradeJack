@@ -122,6 +122,7 @@ class PaperExchange:
         state_dir: str = "state",
         account_id: int = 900,             # reserved id range for live-paper accounts, distinct from Crucible child_ids
         depth_levels_visible: int = 20,
+        price_sample_min_interval_sec: float = 1.0,
     ):
         self.symbol = symbol
         self.taker_fee_bps = taker_fee_bps
@@ -131,6 +132,8 @@ class PaperExchange:
         self.latency_std_sec = latency_std_sec
         self.depth_levels_visible = depth_levels_visible
         self.account_id = account_id
+        self.price_sample_min_interval_sec = price_sample_min_interval_sec
+        self._last_price_sample_wall_time = 0.0
 
         self.accounting = PortfolioAccountingEngine(
             child_id=account_id, state_dir=state_dir, initial_cash=initial_cash
@@ -159,6 +162,12 @@ class PaperExchange:
                 requested_qty REAL, filled_qty REAL, avg_price REAL, mid_at_decision REAL,
                 fee_paid REAL, latency_sec REAL, levels_consumed INTEGER,
                 fully_filled INTEGER, rejected_reason TEXT, resulting_cash REAL, resulting_equity REAL
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS price_samples (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp REAL, mid_price REAL
             )
         """)
         conn.commit()
@@ -194,6 +203,35 @@ class PaperExchange:
         if bid > 0 and ask > 0:
             self.last_mid_price = (bid + ask) / 2.0
             self._mark_to_market(snap.get("timestamp", time.time()))
+            self._maybe_record_price_sample(snap.get("timestamp", time.time()))
+
+    def _maybe_record_price_sample(self, market_ts: float):
+        """
+        Separate, lightweight price-series table (not a change to
+        PortfolioAccountingEngine's own ledger schema, which other consumers
+        like session_report.py already depend on the exact shape of) --
+        exists specifically so a dashboard can plot a real price line with
+        entry/exit fill markers overlaid, instead of only isolated trade
+        points with nothing connecting them. Throttled to at most one sample
+        per `price_sample_min_interval_sec` (default 1s) so a long-running
+        deployment's table doesn't grow unbounded at full tick resolution --
+        equity/mark-to-market still updates every tick via _mark_to_market,
+        only this separate chart-oriented sampling is throttled.
+        """
+        now = time.time()
+        if (now - self._last_price_sample_wall_time) < self.price_sample_min_interval_sec:
+            return
+        self._last_price_sample_wall_time = now
+        try:
+            conn = sqlite3.connect(self.fill_db_path, timeout=5)
+            conn.execute(
+                "INSERT INTO price_samples (timestamp, mid_price) VALUES (?, ?)",
+                (market_ts, self.last_mid_price),
+            )
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            logger.error(f"Price sample write failed: {e}")
 
     def _mark_to_market(self, market_ts: float):
         if self.last_mid_price is None:
@@ -210,6 +248,22 @@ class PaperExchange:
         [-1, 1], computes the required order, sleeps out a sampled realistic
         latency against the REAL live book, then fills against whatever the
         book has become by the time the (simulated) order would have arrived.
+
+        BUG FOUND WHILE BUILDING execution/live_exchange_bridge.py, not by
+        reading this file: target_frac's [-1, 1] range implicitly assumes
+        short-selling is possible (target_frac=-1 meaning "100% short"). This
+        is a SPOT exchange -- there is no shorting, `position_qty` can never
+        go negative in reality. The real exchange adapter naturally rejects
+        an order that would do this (insufficient balance to sell), which is
+        exactly how this got caught -- but THIS class, being a local
+        simulation with no such natural constraint, was silently allowing the
+        model to "sell" more than it held, going net negative, simulating a
+        short position that could never actually exist on a real spot
+        account. That means every past paper-trading result that involved
+        strongly negative target_frac values was optimistic in a way that
+        would not survive contact with a real exchange. Clamped below to
+        long-only: any target implying a short is capped at fully exiting
+        the position (qty_delta down to -position_qty, never further).
         """
         if self._latest_snapshot is None or self.last_mid_price is None:
             return FillResult(0, 0, 0, 0, 0, 0, False, rejected_reason="no_book_data_yet")
@@ -220,10 +274,17 @@ class PaperExchange:
         equity = self.accounting.equity
         target_qty = (target_frac * equity) / mid_at_decision
         qty_delta = target_qty - self.position_qty
+
+        clamped = False
+        if self.position_qty + qty_delta < 0:
+            qty_delta = -self.position_qty  # long-only: sell at most everything we hold, never short
+            clamped = True
+
         side = "buy" if qty_delta > 0 else "sell"
 
         if abs(qty_delta * mid_at_decision) < self.filters.min_notional:
-            result = FillResult(qty_delta, 0.0, 0.0, 0.0, 0.0, 0, False, rejected_reason="below_min_notional")
+            reason = "below_min_notional" if not clamped else "below_min_notional_after_long_only_clamp"
+            result = FillResult(qty_delta, 0.0, 0.0, 0.0, 0.0, 0, False, rejected_reason=reason)
             self._log_fill(side, result, mid_at_decision)
             return result
 

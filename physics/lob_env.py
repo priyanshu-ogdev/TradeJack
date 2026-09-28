@@ -104,9 +104,13 @@ class TradeJackLOBEnv(BaseEnv):
         end_date: str = "2024-01-05",
         initial_cash: float = 10.0,
         seq_len: int = 64,
-        data_store_dir: str = "d:/TradeJack/data_store",
+        data_store_dir: str = "data_store",
         child_id: int = 0,
         render_mode: str = None,
+        reward_mode: str = "log_return",  # "log_return" (existing default) | "differential_sharpe" (new, see step())
+        dsr_eta: float = 1.0 / 252,  # DSR adaptation rate; 1/252 treats each tick like a "trading day" in the classic Moody & Wu formulation -- tune for your actual tick frequency
+        turnover_penalty_coef: float = 0.0,  # opt-in (default 0 = no behavior change): penalizes |traded notional| / equity per tick, distinct from the fee itself -- see step()'s docstring note for why this is a separate term
+        continuous_risk_penalty_coef: float = 0.0,  # opt-in (default 0 = no behavior change): a dense, every-tick penalty proportional to CURRENT drawdown, supplementing the existing sparse new-high-water-mark-only dd_penalty
     ):
         if GYM_AVAILABLE:
             super().__init__()
@@ -117,8 +121,24 @@ class TradeJackLOBEnv(BaseEnv):
         self.seq_len = seq_len
         self.child_id = child_id
         self.render_mode = render_mode
-        
-        self.taker_fee_bps = 4.0  # 0.04% exchange fee (4 basis points)
+        self.reward_mode = reward_mode
+        assert reward_mode in ("log_return", "differential_sharpe"), f"Unknown reward_mode: {reward_mode}"
+        self.dsr_eta = dsr_eta
+        self._dsr_mu = 0.0
+        self._dsr_m2 = 0.0
+        self.turnover_penalty_coef = turnover_penalty_coef
+        self.continuous_risk_penalty_coef = continuous_risk_penalty_coef
+
+        # BUG FOUND WHILE REVIEWING THE RL LAYER, not by reading it: this was
+        # 4.0 bps (0.04%) -- LOWER than the 10.0 bps (0.10%) Binance's actual
+        # VIP0 default taker fee that execution/paper_exchange.py already
+        # correctly uses (verified against Binance's current fee schedule
+        # earlier this project). Training with a cheaper fee than execution
+        # actually charges means every policy was optimized against costs
+        # that don't match what it will actually pay -- a train/serve
+        # mismatch in the reward signal itself, not just a display
+        # inconsistency. Corrected to match.
+        self.taker_fee_bps = 10.0  # 0.10% exchange fee, matching Binance VIP0 default (was 4.0 -- see note above)
         self.funding_rate_daily = 0.0001 # 0.01% per day synthetic funding bleed
         self.ticks_per_day = 1440.0
         
@@ -186,6 +206,8 @@ class TradeJackLOBEnv(BaseEnv):
         self.accounting = PortfolioAccountingEngine(child_id=self.child_id, initial_cash=self.initial_cash)
         self.position_qty = 0.0
         self.prev_dd = 0.0
+        self._dsr_mu = 0.0
+        self._dsr_m2 = 0.0
         
         # Z-score tracking (Bug 3 Fix)
         self.obs_mean = np.zeros(5, dtype=np.float32)
@@ -324,29 +346,65 @@ class TradeJackLOBEnv(BaseEnv):
         target_dollar_val = target_frac * self.accounting.equity
         target_qty = target_dollar_val / (current_price + 1e-8)
         qty_delta = target_qty - self.position_qty
-        
+
+        # BUG FOUND WHILE REVIEWING THE RL LAYER, not by reading it: no clamp
+        # existed here at all. target_frac's [-1, 1] range implicitly assumes
+        # short-selling is possible; this is a SPOT instrument, there is no
+        # shorting, position_qty can never go negative in reality. Without
+        # this clamp, every model trained through this env was learning
+        # against a training signal that permitted trades no real spot
+        # account could ever execute -- a training/execution mismatch, not
+        # just an execution-layer one (the same bug was independently found
+        # and fixed in execution/paper_exchange.py and
+        # execution/live_exchange_bridge.py, but THIS is the actual training
+        # signal every checkpoint has been shaped by; fixing execution alone
+        # left the model still being trained to want something it can never
+        # have). Clamped identically: cap at fully exiting the position,
+        # never past it.
+        if self.position_qty + qty_delta < 0:
+            qty_delta = -self.position_qty
+            target_qty = self.position_qty + qty_delta
+
         exec_px, friction_cost = self.compute_friction_fill_price(qty_delta, current_price, current_kl)
-        
+
         new_cash = self.accounting.cash
-        if abs(qty_delta * current_price) > 0.10:
+        traded_this_tick = abs(qty_delta * current_price) > 0.10
+        if traded_this_tick:
             trade_cost = qty_delta * exec_px
             new_cash -= trade_cost
             self.position_qty = target_qty
-                
-        new_equity = new_cash + (self.position_qty * current_price)
-        
-        # REAL-WORLD PHYSICS: Exchange Taker Fee & Funding Rate Decay
-        notional_value = abs(self.position_qty * current_price)
 
-        # 1. Taker Fee (Paid only when executing a market order)
+        new_equity = new_cash + (self.position_qty * current_price)
+
+        # REAL-WORLD PHYSICS: Exchange Taker Fee & Funding Rate Decay
+        # BUG FOUND WHILE REVIEWING REWARD/PENALTY DESIGN FOR GENERALIZATION,
+        # not by reading it: `notional_value` here used to be computed from
+        # `self.position_qty` (the TOTAL position, already updated to the new
+        # target above) rather than from `qty_delta` (the actual TRADED
+        # amount). Real exchange fees are charged on what you trade, not on
+        # what you hold — the previous version charged a fee proportional to
+        # total position size on every ticks a trade occurred, regardless of
+        # whether that trade was a tiny 1% rebalance or a full position
+        # entry. This is exactly the failure mode current RL-for-trading
+        # research warns about generalizing badly: "realistic evaluation
+        # must penalize turnover and execution cost, as methods that ignore
+        # these often overfit" (multiple 2020-2026 sources). A fee signal
+        # that doesn't scale with trade size teaches the wrong lesson
+        # entirely. Fixed to scale with the traded notional.
+        traded_notional = abs(qty_delta * current_price)
+
         taker_fee = 0.0
-        if abs(qty_delta * current_price) > 0.10:
-            taker_fee = notional_value * (self.taker_fee_bps / 10000.0)
+        if traded_this_tick:
+            taker_fee = traded_notional * (self.taker_fee_bps / 10000.0)
             new_cash -= taker_fee
 
-        # 2. Funding Rate / Swap Decay (Bleeds continuously while holding a position)
-        # Simulates the 8-hour crypto perp funding rate or Forex overnight swap
-        funding_bleed = notional_value * (self.funding_rate_daily / self.ticks_per_day)
+        # Funding Rate / Swap Decay (Bleeds continuously while holding a position)
+        # Simulates the 8-hour crypto perp funding rate or Forex overnight swap.
+        # This one correctly scales with TOTAL position held (funding/carry
+        # cost is charged on what you hold, not what you traded) -- computed
+        # from the position AFTER this tick's trade, same as before.
+        position_notional = abs(self.position_qty * current_price)
+        funding_bleed = position_notional * (self.funding_rate_daily / self.ticks_per_day)
         new_cash -= funding_bleed
 
         # Recalculate final equity after exchange tolls
@@ -370,8 +428,68 @@ class TradeJackLOBEnv(BaseEnv):
         if summary["max_drawdown"] > self.prev_dd:
             dd_penalty = (summary["max_drawdown"] - self.prev_dd) * 5.0
         self.prev_dd = summary["max_drawdown"]
-        
-        reward = log_ret - dd_penalty
+
+        # Two new OPT-IN penalty terms (both default coefficient 0.0 --
+        # exactly zero effect unless explicitly configured, so nothing about
+        # existing behavior changes silently). Grounded in current
+        # RL-for-trading research surveyed while reviewing this reward
+        # function for generalization, not guessed:
+        #
+        # turnover_penalty: proportional to traded notional relative to
+        # equity, DISTINCT from the taker fee above. Research consistently
+        # flags that ignoring turnover cost in the reward (beyond the raw
+        # fee dollar amount) lets policies overfit to noise in the training
+        # data by trading on signals too small to be real, since the fee
+        # alone may not be large enough to discourage it at the margin a
+        # gradient-based policy actually explores. ("Realistic evaluation
+        # must penalize turnover and execution cost, as methods that ignore
+        # these often overfit" -- recurring theme across multiple
+        # 2020-2026 sources.)
+        #
+        # continuous_risk_penalty: proportional to CURRENT drawdown level
+        # every tick, not just new-high-water-mark breaches like dd_penalty
+        # above. dd_penalty alone is sparse and spiky -- zero for long
+        # stretches, then a sharp jump exactly when a new low is hit. A
+        # dense, continuous risk term gives the policy gradient a consistent
+        # risk-aversion signal throughout an episode rather than only at
+        # breach moments, which several risk-sensitive-RL papers (CVaR-based
+        # reward shaping, quadratic risk terms in portfolio-RL literature)
+        # use for exactly this reason -- denser signal, lower gradient
+        # variance, generally associated with better out-of-sample behavior.
+        turnover_penalty = self.turnover_penalty_coef * (traded_notional / max(new_equity, 1e-8))
+        continuous_risk_penalty = self.continuous_risk_penalty_coef * summary["max_drawdown"]
+
+        if self.reward_mode == "differential_sharpe":
+            # Differential Sharpe Ratio (Moody & Wu, 1997), in the exact form
+            # used by recent RL-trading-environment literature (e.g. arxiv
+            # 2603.29086's Eq. 5-7): an online, per-step approximation of the
+            # Sharpe ratio, updated via an exponential moving average of
+            # returns and squared returns rather than a full-episode batch
+            # Sharpe computation. Chosen as an OPT-IN alternative, not a
+            # replacement of the existing log_ret - dd_penalty default:
+            # research on this is genuinely mixed -- Sharpe-family rewards
+            # are reported to outperform pure profit-based rewards in some
+            # studies, but at least one direct comparison (arxiv 2405.13609)
+            # found exact-Sharpe training outperformed differential-Sharpe
+            # training on the same task. Worth trying, not worth forcing.
+            r_t = (new_equity / prev_equity - 1.0) if prev_equity > 0 else -1.0
+            prev_mu, prev_m2 = self._dsr_mu, self._dsr_m2
+            delta_mu = r_t - prev_mu
+            delta_m2 = r_t ** 2 - prev_m2
+            prev_sigma2 = max(prev_m2 - prev_mu ** 2, 1e-12)
+
+            # DSR_t = (sigma_{t-1}^2 * delta_mu - 0.5 * mu_{t-1} * delta_m2) / sigma_{t-1}^3
+            dsr = (prev_sigma2 * delta_mu - 0.5 * prev_mu * delta_m2) / (prev_sigma2 ** 1.5 + 1e-12)
+
+            self._dsr_mu = (1 - self.dsr_eta) * prev_mu + self.dsr_eta * r_t
+            self._dsr_m2 = (1 - self.dsr_eta) * prev_m2 + self.dsr_eta * (r_t ** 2)
+
+            dd_penalty_sq = 0.0
+            if summary["max_drawdown"] > self.prev_dd:
+                dd_penalty_sq = (summary["max_drawdown"] - self.prev_dd) ** 2 * 5.0
+            reward = float(np.clip(dsr - dd_penalty_sq - turnover_penalty - continuous_risk_penalty, -10.0, 10.0))  # DSR is unbounded near-zero variance; clip defensively, don't let one degenerate tick dominate an episode's gradient
+        else:
+            reward = log_ret - dd_penalty - turnover_penalty - continuous_risk_penalty
         
         terminated = False
         truncated = False

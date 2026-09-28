@@ -28,7 +28,7 @@ class LineageVectorDB:
     Tracks evolutionary lineage across all 50 sovereign Child containers.
     """
 
-    def __init__(self, db_path: str = "d:/TradeJack/state/lineage_db"):
+    def __init__(self, db_path: str = "state/lineage_db"):
         self.db_path = os.path.abspath(db_path)
         os.makedirs(self.db_path, exist_ok=True)
         self.fallback_file = os.path.join(self.db_path, "lineage_records.json")

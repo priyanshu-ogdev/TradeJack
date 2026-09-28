@@ -30,7 +30,7 @@ def parse_args():
     parser.add_argument("--weights", required=True, help="Path to candidate weights file (.pt)")
     parser.add_argument("--model", required=True, help="Model architecture name (e.g. SAC-DilatedCNN)")
     parser.add_argument("--child-id", type=int, required=True, help="Source child ID in the Crucible")
-    parser.add_argument("--data-store", default="d:/TradeJack/data_store", help="Path to data store")
+    parser.add_argument("--data-store", default="data_store", help="Path to data store")
     parser.add_argument("--force", action="store_true", help="Skip interactive confirmation (still requires human intent)")
     return parser.parse_args()
 

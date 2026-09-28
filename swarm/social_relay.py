@@ -63,7 +63,7 @@ class SocialRelayBridge:
     Decentralized communication layer linking the 50 containerized agents.
     """
 
-    def __init__(self, child_id: int = 0, state_dir: str = "d:/TradeJack/state"):
+    def __init__(self, child_id: int = 0, state_dir: str = "state"):
         self.child_id = child_id
         self.state_dir = os.path.abspath(state_dir)
         self.relay_dir = os.path.join(self.state_dir, "social_relay")

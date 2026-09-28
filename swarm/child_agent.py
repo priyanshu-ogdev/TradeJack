@@ -55,8 +55,8 @@ class SovereignChild:
         child_id: int = 0,
         symbol: str = "BTC-USDT",
         initial_cash: float = 10.0,
-        state_dir: str = "d:/TradeJack/state",
-        data_store_dir: str = "d:/TradeJack/data_store",
+        state_dir: str = "state",
+        data_store_dir: str = "data_store",
         model_name: str = "PPO-DilatedCNN",
         train_every_k: int = 50,
         use_sb3_training: bool = True,
@@ -81,7 +81,7 @@ class SovereignChild:
         # Initialize Subsystems
         self.compute_skill = DGXComputeSkill(child_id=self.child_id)
         self.self_mod = SelfModEngine(child_id=self.child_id, state_dir=self.state_dir)
-        self.rollback_engine = GitFinancialRollback(child_id=self.child_id, repo_dir="d:/TradeJack")
+        self.rollback_engine = GitFinancialRollback(child_id=self.child_id, repo_dir=".")
         self.social_relay = SocialRelayBridge(child_id=self.child_id, state_dir=self.state_dir)
         self.her_buffer = HindsightExperienceReplay(capacity=10000)
         self.spoofer = AdversarialGANSpoofer(spoof_intensity=0.2)
@@ -373,7 +373,7 @@ if __name__ == "__main__":
     # Ensure synthetic data exists
     from data_forge.parquet_ingest import ParquetIngestPipeline
     import asyncio
-    ingest = ParquetIngestPipeline(data_store_dir="d:/TradeJack/data_store")
+    ingest = ParquetIngestPipeline(data_store_dir="data_store")
     asyncio.run(ingest.generate_synthetic_crucible_data(symbol="BTC-USDT", num_days=1, ticks_per_day=150))
 
     child = SovereignChild(child_id=1, symbol="BTC-USDT", initial_cash=10.0)

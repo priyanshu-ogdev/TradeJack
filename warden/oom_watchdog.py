@@ -19,7 +19,7 @@ logger = logging.getLogger("OOMWatchdog")
 class RecklessnessWatchdog:
     def __init__(
         self,
-        state_dir: str = "d:/TradeJack/state",
+        state_dir: str = "state",
         penalty_dollars: float = 10.0,
         lockout_duration_seconds: float = 86400.0
     ):
@@ -33,8 +33,23 @@ class RecklessnessWatchdog:
         self._monitor_thread: Optional[threading.Thread] = None
 
     def apply_oom_penalty(self, child_id: int, container_name: str, reason: str = "CUDA_OOM_KILLED"):
-        """Locks the child into Tier 3 via the oom_penalties table."""
+        """Locks the child into Tier 3 via the oom_penalties table.
+
+        BUG FOUND BY ACTUALLY CALLING THIS, not by reading it: `db_path`'s
+        parent directory (`state/child_{id}/`) was never created before
+        `sqlite3.connect()`, which fails with "unable to open database file"
+        rather than creating it (SQLite does not create parent directories).
+        The exception was caught and logged, so this failed silently in
+        exactly the same "looks successful, penalty never actually applied"
+        way the BUG-2 FIX comment below already documents for a different
+        cause. This matters most in precisely the scenario this method exists
+        for: a child that just OOM-crashed may never have written its own
+        ledger yet, so its directory may not exist at all -- the watchdog
+        firing for the first time on a given child was the likely-common case
+        that would have silently failed to apply any penalty at all.
+        """
         db_path = os.path.join(self.state_dir, f"child_{child_id}", "ledger.sqlite")
+        os.makedirs(os.path.dirname(db_path), exist_ok=True)
         current_time = time.time()
         lock_until = current_time + self.lockout_duration_seconds
         

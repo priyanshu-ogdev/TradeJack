@@ -32,6 +32,9 @@ python -m unittest discover -s tests -v
 | **`test_escrow_airgap.py`** | `test_validation_airgap_and_refund_on_rejection` | Verifies 10x Airgap stress testing and 100% refund when weights fail validation. | `ok` |
 | **`test_escrow_airgap.py`** | `test_airgap_validation_engine_splits` | Verifies out-of-sample evaluation across historical flash-crash splits. | `ok` |
 
+### Coverage gap, stated rather than hidden
+`swarm/ewc_sb3_adapter.py` (`PolicyEWC`), `swarm/plasticity_manager.py` (`PlasticityManager`), and `swarm/sb3_replay_buffer_adapter.py` (`SB3ReplayBufferAdapter`) — all load-bearing parts of the actual continuous-training loop as of the v3 upgrade below — do not yet have a formal `unittest` module under `tests/`. Each has a runnable self-test (`python -m swarm.ewc_sb3_adapter`, `python -m swarm.plasticity_manager`, `python -m swarm.sb3_replay_buffer_adapter`) that exercises it end-to-end against all three algorithms (PPO/SAC/DQN) with real gradient updates, but promoting these into `tests/` proper (with assertions wired into the standard suite rather than print statements) is a real, worthwhile gap to close before calling verification complete.
+
 ---
 
 ## 2. Local Laptop Development & Simulation Mode
@@ -41,7 +44,7 @@ When executed on a development machine without CUDA hardware, the `genesis_prime
 To run the full sandbox Crucible loop locally (where agents are executed via threads instead of Docker containers):
 
 ```bash
-$env:PYTHONPATH="d:\TradeJack"; python -m scripts.genesis_prime
+PYTHONPATH="." python -m scripts.genesis_prime
 ```
 
 ---

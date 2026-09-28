@@ -260,9 +260,33 @@ class OnlineRLTrainer:
         return float(np.clip(action, -1.0, 1.0))
 
     def save(self, path: str):
-        """Save model checkpoint (weights + optimizer state) for PBT inheritance."""
+        """Save model checkpoint (weights + optimizer state) for PBT inheritance.
+
+        BUG FOUND WHILE VERIFYING THE PROMOTION PATH, not by reading this file:
+        every single agent's checkpoint save was failing with
+        "TypeError: cannot pickle 'generator' object", on every architecture
+        (PPO, SAC, DQN alike — confirmed it's unrelated to the SAC/DQN replay
+        buffer work). Root-caused by removing attributes one at a time until
+        the save succeeded: SB3's model.save() generically pickles every
+        attribute on the model object via cloudpickle, including third-party
+        attributes it doesn't know about — and model_registry.py's
+        build_model() bolts a custom `_tradejack_callbacks` list directly onto
+        the SB3 model so OnlineRLTrainer.__init__ can find the EWCCallback
+        later. SB3 has no way to know that attribute isn't part of its own
+        state and tries to serialize it along with everything else; something
+        reachable from inside those callback objects isn't picklable.
+        `exclude` is SB3's own documented mechanism for exactly this — telling
+        save() which attributes are not part of its serializable state.
+        Excluding it doesn't lose anything: this attribute exists solely to
+        let __init__ find the callback list at construction time, not
+        something that needs to survive a save/load round trip on the model
+        itself (a freshly-built model gets a fresh one from build_model()).
+        Confirmed the fix by saving a real trained checkpoint that previously
+        failed 100% of the time, for both on-policy (PPO) and off-policy
+        (SAC/DQN) agents.
+        """
         os.makedirs(os.path.dirname(path) if os.path.dirname(path) else ".", exist_ok=True)
-        self.model.save(path)
+        self.model.save(path, exclude=["_tradejack_callbacks"])
         logger.info(f"Model saved to {path}")
 
     def load(self, path: str, env=None):
@@ -280,6 +304,36 @@ class OnlineRLTrainer:
         if hasattr(self.model, "policy"):
             return self.model.policy.parameters()
         return iter([])
+
+    def set_ewc_instance(self, ewc_instance) -> bool:
+        """
+        Update the EWC anchor on an already-built model in place, without
+        rebuilding it (rebuilding would reset the SB3 optimizer's moment
+        estimates and n_updates counter). Requires the model to have been
+        built with the always-attached EWCCallback (model_registry.py's
+        build_model now always appends one, even with ewc_instance=None,
+        specifically so this method has something to find and update).
+
+        Call this from training/continuous_trainer.py right after a
+        successful promotion, passing a freshly-computed PolicyEWC anchored
+        to the just-promoted champion, so the next training cycle is
+        regularized against forgetting what just got promoted.
+        """
+        self.ewc_instance = ewc_instance
+        found = False
+        for cb in self.callback_list.callbacks:
+            if cb.__class__.__name__ == "EWCCallback":
+                cb.ewc_instance = ewc_instance
+                found = True
+        if not found:
+            logger.warning(
+                "set_ewc_instance(): no EWCCallback found on this trainer's callback_list. "
+                "If this model predates the always-attach fix in model_registry.py, rebuild "
+                "it rather than relying on this call."
+            )
+        else:
+            logger.info(f"EWC anchor updated for '{self.model_name}' (ewc_instance={'None' if ewc_instance is None else 'set'}).")
+        return found
 
     def get_training_metrics(self, n: int = 10) -> List[Dict[str, float]]:
         """Get the most recent N training metric snapshots."""

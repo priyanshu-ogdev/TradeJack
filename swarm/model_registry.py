@@ -111,22 +111,83 @@ if SB3_AVAILABLE:
             return True
 
         def _on_rollout_end(self) -> None:
-            """Apply EWC correction after each rollout/training cycle."""
+            """
+            NOTE: deliberately does nothing now. SB3's on-policy learn() loop
+            calls collect_rollouts() -> callback.on_rollout_end() -> self.train(),
+            and train() always starts with optimizer.zero_grad(). A gradient set
+            here (the previous version of this callback called penalty.backward()
+            in this exact hook) gets silently wiped before any optimizer.step()
+            ever sees it — confirmed by tracing SB3's actual call order, not by
+            assumption. The real correction now happens in _on_training_end,
+            which fires after train() has already applied its own update for
+            this learn() call and nothing subsequent can wipe it.
+            """
+            return
+
+        def _on_training_end(self) -> None:
+            """Applies one standalone EWC gradient step after SB3's own RL
+            update for this learn() call has already completed. Fires once per
+            trainer.learn(...) call (i.e. once per training cycle in
+            ContinuousTrainer/CrucibleTournament), not once per rollout — EWC
+            is a slow regularizer toward the last-promoted weights, not part
+            of the primary learning signal, so it doesn't need to fire more
+            often than that.
+
+            BUG FOUND BY ACTUALLY RUNNING THIS FOR SAC, not by reading it:
+            this originally assumed a single `policy.optimizer`, which is
+            true for PPO and DQN (one optimizer over the whole policy) but
+            NOT for SAC — SAC's actor and critic are optimized separately via
+            `actor.optimizer` and `critic.optimizer`, and `policy.optimizer`
+            doesn't exist on an SAC policy at all. The original code's
+            `getattr(policy, "optimizer", None)` silently returned None and
+            the whole EWC correction step no-opped for every SAC cycle,
+            confirmed by the "Policy has no .optimizer attribute" warning
+            firing on every single SAC training cycle in testing. Now handles
+            both optimizer layouts explicitly instead of assuming one."""
             if self.ewc_instance is None:
                 return
-            # Compute EWC penalty and add as a regularization step
+            if not TORCH_AVAILABLE or not hasattr(self.model, "policy"):
+                return
             try:
                 policy = self.model.policy
                 penalty = self.ewc_instance.penalty(policy)
-                if TORCH_AVAILABLE and isinstance(penalty, torch.Tensor) and penalty.requires_grad:
-                    penalty.backward()
-                    # Scale gradients down to act as regularization, not primary signal
-                    for param in policy.parameters():
-                        if param.grad is not None:
-                            param.grad.data *= 0.01
-            except Exception as e:
+                if not (isinstance(penalty, torch.Tensor) and penalty.requires_grad):
+                    logger.warning(
+                        "EWC penalty has no gradient (0 matching parameter names between "
+                        "the calibrated anchor and the current policy) — EWC is currently "
+                        "NOT protecting against catastrophic forgetting this cycle."
+                    )
+                    return
+
+                optimizers = []
+                if getattr(policy, "optimizer", None) is not None:
+                    optimizers = [policy.optimizer]  # PPO, DQN: one unified optimizer
+                elif hasattr(self.model, "actor") and hasattr(self.model, "critic"):
+                    # SAC (and any future TD3-style algorithm): separate actor/critic
+                    # optimizers. penalty already sums over ALL matching parameters
+                    # (both actor.* and critic.* names), so a single backward() call
+                    # populates .grad on both sets of parameters correctly — we just
+                    # need to step both optimizers to actually apply those grads,
+                    # since zero_grad()/step() are per-optimizer, not per-parameter.
+                    optimizers = [o for o in (self.model.actor.optimizer, self.model.critic.optimizer) if o is not None]
+
+                if not optimizers:
+                    logger.warning(
+                        f"No optimizer found on {type(self.model).__name__} (checked policy.optimizer "
+                        f"and actor/critic.optimizer) — cannot apply EWC step."
+                    )
+                    return
+
+                for opt in optimizers:
+                    opt.zero_grad()
+                penalty.backward()
+                torch.nn.utils.clip_grad_norm_(policy.parameters(), max_norm=1.0)
+                for opt in optimizers:
+                    opt.step()
                 if self.verbose > 0:
-                    logger.debug(f"EWC callback error (non-fatal): {e}")
+                    logger.debug(f"EWC correction step applied: penalty={float(penalty.detach()):.6f}")
+            except Exception as e:
+                logger.error(f"EWC callback error: {e}")
 
 
 # ─── REGISTRY ───
@@ -333,9 +394,12 @@ class TradeJackModelRegistry:
         )
 
         # Build callbacks
-        callbacks = []
-        if ewc_instance is not None:
-            callbacks.append(EWCCallback(ewc_instance=ewc_instance))
+        # Always attach an EWCCallback, even with ewc_instance=None initially, so
+        # OnlineRLTrainer.set_ewc_instance() can find and populate it later
+        # (e.g. after the first promotion) without rebuilding the model, which
+        # would reset the SB3 optimizer's state. The callback itself is a no-op
+        # whenever ewc_instance is None.
+        callbacks = [EWCCallback(ewc_instance=ewc_instance)]
 
         # Wrap env for DQN (needs discrete actions)
         target_env = env
@@ -360,6 +424,16 @@ class TradeJackModelRegistry:
                 verbose=0,
             )
         elif card.algo_class == "SAC":
+            use_prio = hp.get("use_prioritized_replay", True)
+            replay_kwargs = {}
+            if use_prio:
+                from swarm.sb3_replay_buffer_adapter import SB3ReplayBufferAdapter
+                replay_kwargs["replay_buffer_class"] = SB3ReplayBufferAdapter
+                replay_kwargs["replay_buffer_kwargs"] = dict(
+                    her_ratio=hp.get("her_ratio", 0.8),
+                    alpha=hp.get("per_alpha", 0.6),
+                    beta=hp.get("per_beta", 0.4),
+                )
             model = SAC(
                 "MultiInputPolicy",
                 target_env,
@@ -374,8 +448,19 @@ class TradeJackModelRegistry:
                 policy_kwargs=policy_kwargs,
                 device=device,
                 verbose=0,
+                **replay_kwargs,
             )
         elif card.algo_class == "DQN":
+            use_prio = hp.get("use_prioritized_replay", True)
+            replay_kwargs = {}
+            if use_prio:
+                from swarm.sb3_replay_buffer_adapter import SB3ReplayBufferAdapter
+                replay_kwargs["replay_buffer_class"] = SB3ReplayBufferAdapter
+                replay_kwargs["replay_buffer_kwargs"] = dict(
+                    her_ratio=hp.get("her_ratio", 0.8),
+                    alpha=hp.get("per_alpha", 0.6),
+                    beta=hp.get("per_beta", 0.4),
+                )
             model = DQN(
                 "MultiInputPolicy",
                 target_env,
@@ -391,6 +476,7 @@ class TradeJackModelRegistry:
                 policy_kwargs=policy_kwargs,
                 device=device,
                 verbose=0,
+                **replay_kwargs,
             )
         else:
             raise ValueError(f"Unknown algo_class: {card.algo_class}")

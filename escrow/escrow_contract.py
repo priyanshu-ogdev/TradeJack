@@ -25,7 +25,7 @@ class P2PEscrowBridge:
     Decentralized settlement layer and cryptographic ledger linking the 50 containerized agents.
     """
 
-    def __init__(self, state_dir: str = "d:/TradeJack/state", data_store_dir: str = "d:/TradeJack/data_store"):
+    def __init__(self, state_dir: str = "state", data_store_dir: str = "data_store"):
         self.state_dir = os.path.abspath(state_dir)
         self.escrow_dir = os.path.join(self.state_dir, "escrow")
         os.makedirs(self.escrow_dir, exist_ok=True)

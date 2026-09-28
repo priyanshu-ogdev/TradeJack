@@ -1,0 +1,339 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>TradeJack Dashboard</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+<style>
+  :root {
+    --bg: #0b0e14; --panel: #131722; --border: #232838; --text: #e8eaed;
+    --muted: #8b94a8; --green: #26a69a; --red: #ef5350; --amber: #f5a623; --blue: #5b8def;
+  }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--text); font-family: -apple-system, "Segoe UI", Roboto, sans-serif; }
+  header { display:flex; align-items:center; justify-content:space-between; padding:14px 20px; border-bottom:1px solid var(--border); }
+  header h1 { font-size:16px; margin:0; font-weight:600; letter-spacing:0.3px; }
+  .badge { display:inline-flex; align-items:center; gap:6px; padding:4px 10px; border-radius:12px; font-size:12px; font-weight:600; }
+  .badge.ok { background:rgba(38,166,154,0.15); color:var(--green); }
+  .badge.halt { background:rgba(239,83,80,0.15); color:var(--red); }
+  .dot { width:8px; height:8px; border-radius:50%; background:currentColor; }
+  #killBtn { background:var(--red); color:#fff; border:none; padding:8px 16px; border-radius:6px; font-weight:600; cursor:pointer; font-size:13px; }
+  #killBtn.disengage { background:var(--amber); color:#111; }
+  main { padding:16px 20px; display:grid; grid-template-columns: repeat(auto-fit, minmax(340px, 1fr)); gap:16px; }
+  .panel { background:var(--panel); border:1px solid var(--border); border-radius:10px; padding:14px; }
+  .panel h2 { font-size:13px; text-transform:uppercase; letter-spacing:0.6px; color:var(--muted); margin:0 0 10px 0; }
+  .panel.wide { grid-column: 1 / -1; }
+  .cards { display:flex; gap:10px; flex-wrap:wrap; }
+  .card { flex:1; min-width:140px; background:#0f131c; border:1px solid var(--border); border-radius:8px; padding:10px 12px; }
+  .card .label { font-size:11px; color:var(--muted); text-transform:uppercase; }
+  .card .value { font-size:20px; font-weight:700; margin-top:4px; }
+  .card .value.pos { color:var(--green); } .card .value.neg { color:var(--red); }
+  select, input { background:#0f131c; color:var(--text); border:1px solid var(--border); border-radius:6px; padding:6px 8px; font-size:13px; }
+  table { width:100%; border-collapse:collapse; font-size:12px; }
+  th, td { text-align:left; padding:5px 8px; border-bottom:1px solid var(--border); }
+  th { color:var(--muted); font-weight:600; text-transform:uppercase; font-size:10px; }
+  tr.buy td.side { color:var(--green); } tr.sell td.side { color:var(--red); }
+  .row { display:flex; align-items:center; gap:10px; margin-bottom:10px; flex-wrap:wrap; }
+  .muted { color:var(--muted); font-size:12px; }
+  .balance-item { display:flex; justify-content:space-between; padding:4px 0; border-bottom:1px solid var(--border); font-size:13px; }
+  .note { font-size:11px; color:var(--muted); margin-top:8px; line-height:1.5; }
+  canvas { max-height:280px; }
+  #depositResult { margin-top:8px; font-size:12px; word-break:break-all; }
+  #depositResult .addr { background:#0f131c; padding:8px; border-radius:6px; border:1px solid var(--border); margin-top:4px; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>⬡ TradeJack — Live Telemetry</h1>
+  <div class="row" style="margin:0;">
+    <span id="killBadge" class="badge ok"><span class="dot"></span> RUNNING</span>
+    <button id="killBtn" onclick="toggleKillSwitch()">ENGAGE KILL SWITCH</button>
+  </div>
+</header>
+
+<main>
+
+  <!-- Account overview -->
+  <div class="panel wide">
+    <h2>Accounts</h2>
+    <div class="cards" id="accountCards"><span class="muted">Loading…</span></div>
+  </div>
+
+  <!-- Price + entry/exit -->
+  <div class="panel wide">
+    <h2>Price &amp; Trade Entries / Exits</h2>
+    <div class="row">
+      <label class="muted">Account:</label>
+      <select id="tradeAccountSelect" onchange="refreshTradeChart()"></select>
+      <span class="muted" id="tradeChartNote"></span>
+    </div>
+    <canvas id="priceChart"></canvas>
+  </div>
+
+  <!-- Equity curve -->
+  <div class="panel">
+    <h2>Equity Curve</h2>
+    <canvas id="equityChart"></canvas>
+  </div>
+
+  <!-- RL training progress -->
+  <div class="panel">
+    <h2>RL Agent Progress</h2>
+    <div class="row">
+      <label class="muted">Agent:</label>
+      <select id="agentSelect" onchange="refreshTrainingChart()"></select>
+    </div>
+    <canvas id="trainingChart"></canvas>
+    <div class="note">Dashed vertical markers: <span style="color:var(--blue)">▲ promotion</span> &nbsp;
+      <span style="color:var(--amber)">▲ plasticity reset</span></div>
+  </div>
+
+  <!-- Risk / decisions log -->
+  <div class="panel">
+    <h2>Recent Risk Decisions</h2>
+    <table id="decisionsTable">
+      <thead><tr><th>Tick</th><th>Target</th><th>Approved</th><th>Reason</th><th>Equity</th></tr></thead>
+      <tbody><tr><td colspan="5" class="muted">Loading…</td></tr></tbody>
+    </table>
+  </div>
+
+  <!-- Binance connection -->
+  <div class="panel">
+    <h2>Binance Account</h2>
+    <div id="balanceMode" class="muted" style="margin-bottom:8px;"></div>
+    <div id="balanceList"></div>
+    <div class="row" style="margin-top:12px;">
+      <input id="depositAsset" placeholder="USDT" style="width:90px;">
+      <button onclick="revealDepositAddress()" style="padding:6px 12px; border-radius:6px; border:1px solid var(--border); background:#0f131c; color:var(--text); cursor:pointer;">Show deposit address</button>
+    </div>
+    <div id="depositResult"></div>
+    <div class="note">
+      This dashboard cannot add funds to your account — it can only show you where to send them.
+      Deposit directly on Binance (bank transfer, or send crypto to the address above). There is no
+      withdrawal capability here at all, by design.
+    </div>
+  </div>
+
+</main>
+
+<script>
+const API_TOKEN = localStorage.getItem('tj_dashboard_token') || '';
+let priceChart, equityChart, trainingChart;
+let killEngaged = false;
+
+async function authedFetch(url, opts={}) {
+  opts.headers = Object.assign({}, opts.headers, API_TOKEN ? {'Authorization': 'Bearer ' + API_TOKEN} : {});
+  return fetch(url, opts);
+}
+
+function fmtMoney(v) { return '$' + Number(v).toFixed(2); }
+function fmtTime(t) { return new Date(t*1000).toLocaleTimeString(); }
+
+async function refreshStatus() {
+  const res = await fetch('/api/status'); const data = await res.json();
+  killEngaged = data.kill_switch_engaged;
+  const badge = document.getElementById('killBadge');
+  const btn = document.getElementById('killBtn');
+  if (killEngaged) {
+    badge.className = 'badge halt'; badge.innerHTML = '<span class="dot"></span> HALTED (kill switch)';
+    btn.textContent = 'DISENGAGE KILL SWITCH'; btn.classList.add('disengage');
+  } else {
+    badge.className = 'badge ok'; badge.innerHTML = '<span class="dot"></span> RUNNING';
+    btn.textContent = 'ENGAGE KILL SWITCH'; btn.classList.remove('disengage');
+  }
+
+  const cardsEl = document.getElementById('accountCards');
+  const selectEl = document.getElementById('tradeAccountSelect');
+  const prevSelected = selectEl.value;
+  cardsEl.innerHTML = ''; selectEl.innerHTML = '';
+  if (data.accounts.length === 0) {
+    cardsEl.innerHTML = '<span class="muted">No accounts yet — start a trading session to see data here.</span>';
+  }
+  data.accounts.forEach(a => {
+    const div = document.createElement('div'); div.className = 'card';
+    div.innerHTML = `<div class="label">child_${a.account_id}</div>
+      <div class="value">${fmtMoney(a.equity)}</div>
+      <div class="muted">cash ${fmtMoney(a.cash)} · tick ${a.tick}</div>`;
+    cardsEl.appendChild(div);
+    const opt = document.createElement('option'); opt.value = a.account_id; opt.textContent = 'child_' + a.account_id;
+    selectEl.appendChild(opt);
+  });
+  if (prevSelected) selectEl.value = prevSelected;
+}
+
+async function toggleKillSwitch() {
+  if (!API_TOKEN) {
+    const t = prompt('Enter dashboard token (see server console on first start):');
+    if (!t) return;
+    localStorage.setItem('tj_dashboard_token', t);
+    location.reload(); return;
+  }
+  const res = await authedFetch('/api/kill-switch', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({engage: !killEngaged}),
+  });
+  if (res.status === 401) { alert('Unauthorized — token may be wrong. Clearing it.'); localStorage.removeItem('tj_dashboard_token'); return; }
+  await refreshStatus();
+}
+
+async function refreshTradeChart() {
+  const accountId = document.getElementById('tradeAccountSelect').value;
+  if (!accountId) return;
+  const [priceRes, tradesRes] = await Promise.all([
+    fetch(`/api/price-series?account_id=${accountId}&limit=2000`),
+    fetch(`/api/trades?account_id=${accountId}&limit=300`),
+  ]);
+  const priceData = await priceRes.json();
+  const tradesData = await tradesRes.json();
+  document.getElementById('tradeChartNote').textContent =
+    priceData.points.length === 0 ? '(no price samples yet)' : `${priceData.points.length} price samples, ${tradesData.trades.length} fills`;
+
+  const priceSeries = priceData.points.map(p => ({x: p.t*1000, y: p.price}));
+  const entries = tradesData.trades.filter(t => t.side === 'buy').map(t => ({x: t.timestamp*1000, y: t.avg_price}));
+  const exits = tradesData.trades.filter(t => t.side === 'sell').map(t => ({x: t.timestamp*1000, y: t.avg_price}));
+
+  const ctx = document.getElementById('priceChart');
+  if (priceChart) priceChart.destroy();
+  priceChart = new Chart(ctx, {
+    type: 'scatter',
+    data: { datasets: [
+      { label: 'Price', data: priceSeries, type: 'line', borderColor: '#5b8def', backgroundColor: 'transparent', pointRadius: 0, borderWidth: 1.5, tension: 0.1 },
+      { label: 'Entry (buy)', data: entries, pointStyle: 'triangle', radius: 7, backgroundColor: '#26a69a', borderColor: '#26a69a' },
+      { label: 'Exit (sell)', data: exits, pointStyle: 'triangle', rotation: 180, radius: 7, backgroundColor: '#ef5350', borderColor: '#ef5350' },
+    ]},
+    options: { responsive:true, scales: { x: { type:'linear', ticks: { callback: v => fmtTime(v/1000) } }, y: { ticks: { color:'#8b94a8' } } },
+      plugins: { legend: { labels: { color: '#e8eaed' } } } }
+  });
+}
+
+async function refreshEquityChart() {
+  const accountId = document.getElementById('tradeAccountSelect').value || '900';
+  const res = await fetch(`/api/equity-curve?account_id=${accountId}&limit=2000`);
+  const data = await res.json();
+  const points = data.points.map(p => ({x: p.t*1000, y: p.equity}));
+  const ctx = document.getElementById('equityChart');
+  if (equityChart) equityChart.destroy();
+  equityChart = new Chart(ctx, {
+    type: 'line',
+    data: { datasets: [{ label:'Equity', data: points, borderColor:'#26a69a', backgroundColor:'rgba(38,166,154,0.08)', fill:true, pointRadius:0, borderWidth:1.5 }] },
+    options: { responsive:true, scales: { x: { type:'linear', ticks: { callback: v => fmtTime(v/1000) } }, y: { ticks: { color:'#8b94a8' } } },
+      plugins: { legend: { display:false } } }
+  });
+}
+
+async function refreshAgentList() {
+  const res = await fetch('/api/agents'); const data = await res.json();
+  const sel = document.getElementById('agentSelect');
+  const prev = sel.value;
+  sel.innerHTML = '';
+  data.agents.forEach(a => {
+    const opt = document.createElement('option'); opt.value = a.agent_id;
+    opt.textContent = `${a.label} (${a.model_name})`;
+    sel.appendChild(opt);
+  });
+  if (prev) sel.value = prev;
+}
+
+async function refreshTrainingChart() {
+  const agentId = document.getElementById('agentSelect').value;
+  const url = agentId ? `/api/training-progress?agent_id=${agentId}` : '/api/training-progress';
+  const res = await fetch(url); const data = await res.json();
+
+  const sortinoPoints = data.cycles.map(c => ({x: c.timestamp*1000, y: c.sortino_ratio}));
+  const equityPoints = data.cycles.map(c => ({x: c.timestamp*1000, y: c.equity}));
+
+  const ctx = document.getElementById('trainingChart');
+  if (trainingChart) trainingChart.destroy();
+  trainingChart = new Chart(ctx, {
+    type: 'line',
+    data: { datasets: [
+      { label:'Sortino', data: sortinoPoints, borderColor:'#5b8def', pointRadius:2, borderWidth:1.5, yAxisID:'y' },
+      { label:'Equity', data: equityPoints, borderColor:'#f5a623', pointRadius:2, borderWidth:1.5, yAxisID:'y1' },
+    ]},
+    options: { responsive:true,
+      scales: {
+        x: { type:'linear', ticks: { callback: v => fmtTime(v/1000) } },
+        y: { position:'left', ticks: { color:'#5b8def' }, title: {display:true, text:'Sortino', color:'#5b8def'} },
+        y1: { position:'right', ticks: { color:'#f5a623' }, grid: {drawOnChartArea:false}, title: {display:true, text:'Equity ($)', color:'#f5a623'} },
+      },
+      plugins: { legend: { labels: { color:'#e8eaed' } } } }
+  });
+
+  // event markers rendered as a simple list underneath since Chart.js core
+  // has no annotation plugin loaded (kept dependency-free) -- still
+  // genuinely useful, just a list rather than an in-chart vertical line.
+  let noteEl = document.querySelector('#trainingChart').nextElementSibling;
+  const events = data.events.slice(-8).reverse();
+  noteEl.innerHTML = 'Dashed vertical markers: <span style="color:var(--blue)">▲ promotion</span> &nbsp; <span style="color:var(--amber)">▲ plasticity reset</span>'
+    + (events.length ? '<br>Recent: ' + events.map(e => `${e.event_type}@${fmtTime(e.timestamp)}`).join(', ') : '');
+}
+
+async function refreshDecisions() {
+  const accountId = document.getElementById('tradeAccountSelect').value || '900';
+  const res = await fetch(`/api/decisions?account_id=${accountId}&limit=30`);
+  const data = await res.json();
+  const tbody = document.querySelector('#decisionsTable tbody');
+  tbody.innerHTML = '';
+  if (data.decisions.length === 0) { tbody.innerHTML = '<tr><td colspan="5" class="muted">No decisions yet.</td></tr>'; return; }
+  data.decisions.slice().reverse().forEach(d => {
+    const tr = document.createElement('tr');
+    tr.innerHTML = `<td>${d.tick}</td><td>${d.target_frac.toFixed(3)}</td>
+      <td style="color:${d.approved ? 'var(--green)' : 'var(--red)'}">${d.approved ? 'yes' : 'no'}</td>
+      <td>${d.reject_reason || '—'}</td><td>${fmtMoney(d.equity)}</td>`;
+    tbody.appendChild(tr);
+  });
+}
+
+async function refreshBalance() {
+  const res = await fetch('/api/balance'); const data = await res.json();
+  const modeEl = document.getElementById('balanceMode');
+  const listEl = document.getElementById('balanceList');
+  if (data.error) { modeEl.textContent = 'Error: ' + data.error; listEl.innerHTML = ''; return; }
+  if (data.note) { modeEl.textContent = data.note; listEl.innerHTML = ''; return; }
+  modeEl.textContent = `Mode: ${data.mode.toUpperCase()}`;
+  listEl.innerHTML = '';
+  Object.entries(data.balances || {}).forEach(([asset, amt]) => {
+    const div = document.createElement('div'); div.className = 'balance-item';
+    div.innerHTML = `<span>${asset}</span><span>${amt}</span>`;
+    listEl.appendChild(div);
+  });
+}
+
+async function revealDepositAddress() {
+  if (!API_TOKEN) {
+    const t = prompt('Enter dashboard token (see server console on first start):');
+    if (!t) return;
+    localStorage.setItem('tj_dashboard_token', t);
+    location.reload(); return;
+  }
+  const asset = document.getElementById('depositAsset').value || 'USDT';
+  const res = await authedFetch('/api/deposit-address', {
+    method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({asset}),
+  });
+  const data = await res.json();
+  const el = document.getElementById('depositResult');
+  if (data.error) { el.innerHTML = `<span style="color:var(--red)">${data.error}</span>`; return; }
+  el.innerHTML = `<div>Send <b>${data.asset}</b> (network: ${data.network || 'default'}) to:</div>
+    <div class="addr">${data.address}</div>${data.tag ? `<div>Tag/Memo: ${data.tag}</div>` : ''}`;
+}
+
+async function refreshAll() {
+  await refreshStatus();
+  if (!document.getElementById('tradeAccountSelect').dataset.inited) {
+    document.getElementById('tradeAccountSelect').dataset.inited = '1';
+  }
+  await Promise.all([refreshTradeChart(), refreshEquityChart(), refreshAgentList(), refreshDecisions(), refreshBalance()]);
+  await refreshTrainingChart();
+}
+
+refreshAll();
+setInterval(refreshStatus, 5000);
+setInterval(refreshTradeChart, 10000);
+setInterval(refreshEquityChart, 10000);
+setInterval(refreshDecisions, 10000);
+setInterval(refreshTrainingChart, 20000);
+</script>
+</body>
+</html>

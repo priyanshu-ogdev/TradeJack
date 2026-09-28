@@ -57,6 +57,7 @@ class TournamentAgent:
         label: str,
         data_store_dir: str,
         state_dir: str,
+        progress_ledger: Optional[Any] = None,
         **override_hyperparams,
     ):
         self.agent_id = agent_id
@@ -64,6 +65,7 @@ class TournamentAgent:
         self.label = label
         self.state_dir = state_dir
         self.override_hyperparams = override_hyperparams
+        self.progress_ledger = progress_ledger  # shared TrainingProgressLedger, or None to skip persistence
 
         self.checkpoint_dir = os.path.join(state_dir, f"agent_{agent_id}")
         self.checkpoint_path = os.path.join(self.checkpoint_dir, "model")
@@ -127,6 +129,15 @@ class TournamentAgent:
                 "equity": self.env.accounting.equity if hasattr(self.env, "accounting") else 0.0,
             })
 
+            if self.progress_ledger is not None:
+                self.progress_ledger.record_cycle(
+                    agent_id=self.agent_id, label=self.label, model_name=self.model_name,
+                    algo_class=getattr(getattr(self.trainer, "card", None), "algo_class", "unknown"),
+                    cumulative_timesteps=self.cumulative_timesteps,
+                    sortino_ratio=sortino, best_sortino=self.best_sortino,
+                    equity=result.get("equity", 0.0),
+                )
+
             logger.info(
                 f"[Agent {self.agent_id} / {self.label}] "
                 f"Trained {timesteps} steps. Sortino={sortino:.3f}, "
@@ -161,8 +172,8 @@ class CrucibleTournament:
 
     def __init__(
         self,
-        data_store_dir: str = "d:/TradeJack/data_store",
-        state_dir: str = "d:/TradeJack/state/tournament",
+        data_store_dir: str = "data_store",
+        state_dir: str = "state/tournament",
         symbol: str = "BTC-USDT",
         roster: Optional[List[Dict[str, Any]]] = None,
         pbt_interval: int = 50000,
@@ -180,6 +191,9 @@ class CrucibleTournament:
 
         os.makedirs(self.state_dir, exist_ok=True)
 
+        from swarm.training_progress_ledger import TrainingProgressLedger
+        self.progress_ledger = TrainingProgressLedger(state_dir=self.state_dir)
+
         # Initialize agents
         self.agents: List[TournamentAgent] = []
         for i, cfg in enumerate(self.roster_config):
@@ -190,6 +204,7 @@ class CrucibleTournament:
                 label=cfg.get("label", f"agent_{i}"),
                 data_store_dir=self.data_store_dir,
                 state_dir=self.state_dir,
+                progress_ledger=self.progress_ledger,
                 **hp,
             )
             self.agents.append(agent)

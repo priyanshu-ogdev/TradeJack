@@ -58,7 +58,7 @@ class ValidationAirgapEngine:
         num_splits: int = 10,
         min_required_sharpe: float = 1.0,
         max_allowed_drawdown: float = 0.15,
-        data_store_dir: str = "d:/TradeJack/data_store"
+        data_store_dir: str = "data_store"
     ):
         self.num_splits = num_splits
         self.min_sharpe = min_required_sharpe
@@ -152,6 +152,33 @@ class ValidationAirgapEngine:
             terminated = False
             truncated = False
 
+            # BUG FOUND BY RUNNING THIS, NOT BY READING IT: env.reset(seed=seed) does
+            # NOT actually vary which market data this split sees.
+            # TradeJackLOBEnv._partition_streamer() always walks
+            # sorted(scan_available_partitions(...)) from the start, and
+            # scan_available_partitions() returns a fixed sorted() list independent
+            # of the seed — so every split replayed the exact same tick-0 window.
+            # Combined with a deterministic frozen policy (see _predict_action's
+            # deterministic=True below), that means every "stress split" produced
+            # bit-identical results — confirmed empirically: all 5 splits returned
+            # avg_sharpe=0.13789063752799535 to full float precision in testing.
+            # A validation gate that always evaluates the same scenario provides
+            # zero information about robustness, regardless of how many "splits"
+            # it claims to run.
+            #
+            # Fix: actually vary the window per split by skipping a random number
+            # of ticks (seeded, so reproducible) before starting the measured
+            # window, using a neutral action so the skip itself has no effect on
+            # accounting beyond time passing. This works whether the data store
+            # has 2 days (synthetic/dev) or 200 (real historical) — it doesn't
+            # depend on there being enough distinct partition files to pick from.
+            max_warmup = 400  # keep well under a typical partition's tick count so the eval window doesn't run dry
+            warmup_ticks = int(np.random.randint(0, max_warmup)) if split_idx > 0 else 0
+            for _ in range(warmup_ticks):
+                obs, _, terminated, truncated, info = env.step([0.0])  # neutral: don't distort the measured window's start
+                if terminated or truncated:
+                    break
+
             # Run up to 100 steps on this split
             for _ in range(100):
                 action = self._predict_action(model, obs)
@@ -242,7 +269,7 @@ if __name__ == "__main__":
     logger.info("Testing ValidationAirgapEngine standalone...")
     from data_forge.parquet_ingest import ParquetIngestPipeline
     import asyncio
-    ingest = ParquetIngestPipeline(data_store_dir="d:/TradeJack/data_store")
+    ingest = ParquetIngestPipeline(data_store_dir="data_store")
     asyncio.run(ingest.generate_synthetic_crucible_data(symbol="BTC-USDT", num_days=1, ticks_per_day=150))
 
     airgap = ValidationAirgapEngine(num_splits=3, min_required_sharpe=0.0, max_allowed_drawdown=0.5)

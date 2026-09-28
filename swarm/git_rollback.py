@@ -24,7 +24,7 @@ class GitFinancialRollback:
     def __init__(
         self,
         child_id: int = 0,
-        repo_dir: str = "d:/TradeJack",
+        repo_dir: str = ".",
         drawdown_rollback_threshold: float = 0.15,
         tag_step_dollar: float = 1.0
     ):

@@ -172,8 +172,8 @@ class DeploymentMonitor:
 
 if __name__ == "__main__":
     monitor = DeploymentMonitor(
-        deploy_ledger_path="d:/TradeJack/state/child_0/ledger.sqlite",
-        crucible_stats_path="d:/TradeJack/state/crucible_stats.json",
+        deploy_ledger_path="state/child_0/ledger.sqlite",
+        crucible_stats_path="state/crucible_stats.json",
         out_of_band_threshold=3
     )
     # Simulate Crucible results to populate the band

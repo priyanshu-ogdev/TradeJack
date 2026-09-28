@@ -58,13 +58,15 @@ class ContinuousTrainer:
     def __init__(
         self,
         training_model_name: str = "PPO-DilatedCNN",
-        data_store_dir: str = "d:/TradeJack/data_store",
-        state_dir: str = "d:/TradeJack/state",
-        deployed_model_path: str = "d:/TradeJack/state/deployed/weights_promoted",
+        data_store_dir: str = "data_store",
+        state_dir: str = "state",
+        deployed_model_path: str = "state/deployed/weights_promoted",
         symbol: str = "BTC-USDT",
         train_interval_minutes: float = 30.0,
         timesteps_per_cycle: int = 10000,
         inference_server=None,
+        plasticity_reset_interval_cycles: int = 5,
+        plasticity_fisher_reset_fraction: float = 0.5,
     ):
         self.training_model_name = training_model_name
         self.data_store_dir = os.path.abspath(data_store_dir)
@@ -87,6 +89,19 @@ class ContinuousTrainer:
             min_trade_count=20,
             max_drawdown_threshold=0.15,
             significance_level=0.05,
+        )
+
+        # Primacy-bias / loss-of-plasticity mitigation (Nikishin et al. 2022,
+        # extended with Fisher-guided selectivity per arxiv 2502.00802) --
+        # see swarm/plasticity_manager.py's module docstring for the research
+        # this is grounded in. A system training forever on live,
+        # non-stationary market data is close to exactly the setting this
+        # research studies, so this isn't a speculative addition.
+        from swarm.plasticity_manager import PlasticityManager
+        self.plasticity_manager = PlasticityManager(
+            reset_interval_cycles=plasticity_reset_interval_cycles,
+            fisher_reset_fraction=plasticity_fisher_reset_fraction,
+            use_fisher_guidance=True,
         )
 
         self.cycle_count = 0
@@ -118,6 +133,32 @@ class ContinuousTrainer:
                     # 1. Run one tournament training cycle
                     for agent in self.tournament.agents:
                         agent.train(timesteps=self.timesteps_per_cycle)
+
+                        # Plasticity reset check, per-agent, using that
+                        # agent's own most recently computed Fisher matrix
+                        # (from its last EWC anchor, if any) to guide which
+                        # head layers are safe to reset. Runs every cycle but
+                        # only actually resets once every
+                        # `plasticity_reset_interval_cycles` cycles per agent
+                        # -- see PlasticityManager.maybe_reset()'s own
+                        # internal counter, kept independent of the EWC
+                        # re-anchoring cadence (which only happens on
+                        # promotion, not every cycle) since primacy bias
+                        # accumulates with training steps regardless of
+                        # whether a promotion has happened recently.
+                        if agent.trainer is not None:
+                            fisher = None
+                            existing_ewc = getattr(agent.trainer, "ewc_instance", None)
+                            if existing_ewc is not None:
+                                fisher = existing_ewc.fisher_matrix
+                            did_reset = self.plasticity_manager.maybe_reset(
+                                agent_id=str(agent.agent_id), model=agent.trainer.model, fisher_matrix=fisher
+                            )
+                            if did_reset:
+                                self.tournament.progress_ledger.record_event(
+                                    agent_id=agent.agent_id, event_type="plasticity_reset",
+                                    detail=f"reset #{self.plasticity_manager.reset_count}",
+                                )
 
                     # 2. Run PBT if enough timesteps accumulated
                     total_steps = sum(a.cumulative_timesteps for a in self.tournament.agents)
@@ -221,6 +262,37 @@ class ContinuousTrainer:
 
             self.promotion_count += 1
             logger.info(f"Promotion #{self.promotion_count} complete.")
+            self.tournament.progress_ledger.record_event(
+                agent_id=champion.agent_id, event_type="promotion",
+                detail=f"promotion #{self.promotion_count}",
+            )
+
+            # Re-anchor EWC to the just-promoted policy so the NEXT training
+            # cycle is regularized against forgetting what just got promoted,
+            # instead of drifting freely until the next promotion event.
+            # Non-fatal by design — an EWC failure must never roll back a
+            # promotion that already succeeded, it only affects how gently
+            # future training explores away from this point. Only applies to
+            # PPO-family agents (see PolicyEWC's docstring for why SAC/DQN
+            # aren't supported yet) — other-architecture agents in the
+            # tournament will just see 0 matching parameters and get zero
+            # penalty, which is correct, not broken.
+            try:
+                from swarm.ewc_sb3_adapter import PolicyEWC
+                anchor = PolicyEWC(champion.trainer.model, n_calibration_samples=512)
+                if anchor.n_calibration_samples_used > 0:
+                    updated_count = 0
+                    for agent in self.tournament.agents:
+                        if agent.trainer is not None and agent.trainer.set_ewc_instance(anchor):
+                            updated_count += 1
+                    logger.info(
+                        f"EWC anchor updated on {updated_count}/{len(self.tournament.agents)} "
+                        f"tournament agents from promotion #{self.promotion_count}'s champion."
+                    )
+                else:
+                    logger.warning("EWC anchor computed but had no calibration data — not applied.")
+            except Exception as e:
+                logger.error(f"EWC re-anchoring after promotion failed (non-fatal, promotion itself succeeded): {e}")
 
         except Exception as e:
             logger.error(f"Promotion failed: {e}")

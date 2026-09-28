@@ -167,9 +167,23 @@ class RiskGuardian:
                 raw={"reason": reason},
             )
         if self.exchange is not None:
-            res = await self.exchange.place_market_order(self.symbol, side, qty)
-            self.record_order_executed(side, qty)
-            return res
+            from execution.exchange_adapter import ExchangeBannedError, OrderResult
+            try:
+                res = await self.exchange.place_market_order(self.symbol, side, qty)
+                self.record_order_executed(side, qty)
+                return res
+            except ExchangeBannedError as e:
+                # place_market_order raises this rather than returning a status
+                # when already inside a known ban window (no request sent at
+                # all) — surfacing it as a normal OrderResult here rather than
+                # an uncaught exception, since a risk layer crashing is worse
+                # than a risk layer reporting "banned" and letting the caller
+                # decide how to halt.
+                logger.critical(f"Exchange is banned, order not attempted: {e}")
+                return OrderResult(
+                    order_id="BANNED", symbol=self.symbol, side=side, qty=0.0, avg_price=0.0,
+                    cost=0.0, fee=0.0, timestamp=time.time(), status="banned", raw={"error": str(e)},
+                )
         return None
 
     def get_risk_summary(self) -> dict:

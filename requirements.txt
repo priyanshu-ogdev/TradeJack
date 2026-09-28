@@ -1,37 +1,62 @@
 # TradeJack dependency manifest.
-# This file did not exist anywhere in the repo prior to this upgrade — every module
-# was relying on whatever happened to be installed in the dev environment.
 # Pin ranges, not exact versions, so security patches still flow in; re-pin exact
 # versions with `pip freeze` once you have a validated live-paper session running.
+#
+# Split into CORE (needed to run the SB3 training pipeline, backtests, and paper
+# trading on any machine) and OPTIONAL/GPU (DGX-tier acceleration and features
+# that already degrade gracefully in code via try/except -- confirmed for every
+# entry below by checking the actual import site, not assumed):
+#   - cudf, nvidia.dali*    -> data_forge/kvikio_streamer.py, feature_engineering.py,
+#                              dali_loader.py. RAPIDS/DALI are NOT reliably pip-installable
+#                              in general (conda or NVIDIA's own index is typically required) --
+#                              do not `pip install` these blind, follow RAPIDS' own install docs.
+#   - chromadb              -> warden/lineage_vector_db.py falls back to a local
+#                              ZSTD/SQLite cosine index without it.
+#   - pandera[polars]       -> data_forge/schema.py skips schema validation without it.
+#   - tensorboard           -> swarm/rl_trainer.py adds a tensorboard log format
+#                              only if this is importable; SB3 training works fine without it.
 
-# --- Core numerics / ML (used by model_registry, physics, swarm) ---
+# ============================== CORE ==============================
+
+# --- RL training engine (swarm/rl_trainer.py, model_registry.py) ---
+torch>=2.2
+stable-baselines3>=2.2      # battle-tested PPO/SAC/DQN -- do not hand-roll these from scratch
+gymnasium>=0.29
+
+# --- Core numerics ---
 numpy>=1.26,<2.0
 pandas>=2.1
 scikit-learn>=1.3
-torch>=2.2
+scipy>=1.11                 # statistical significance tests (walk_forward_evaluator.py, session_report.py) --
+                             # NOTE: several promotion/validation gates fail CLOSED (block promotion) when this
+                             # is missing, by design -- do not treat scipy as skippable in a real deployment.
 
-# --- Data & storage (used by data_forge, physics) ---
+# --- Data & storage ---
 polars>=0.20
 pydantic>=2.5
 pydantic-settings>=2.1
-qdrant-client>=1.7
+qdrant-client>=1.7          # data_forge sentiment/embedding store
 
-# --- RL environment interface (physics/lob_env.py) ---
-gymnasium>=0.29
-
-# --- Networking (data_forge live/historical ingest, execution/ live feed) ---
-aiohttp>=3.9
+# --- Networking & live execution ---
+aiohttp>=3.9                 # live Binance WebSocket feed (execution/binance_live_feed.py)
 requests>=2.31
+ccxt>=4.2                    # execution/exchange_adapter.py's BinanceSpotAdapter -- REAL order placement,
+                              # this was missing from the manifest entirely despite being load-bearing for
+                              # any real (non-paper) deployment. Test against Binance testnet before mainnet.
+python-dotenv>=1.0           # load exchange API keys from .env -- never commit real keys to the repo
 
-# --- Telemetry dashboard (warden/deployment_monitor.py, Phase 4 dashboard) ---
+# --- Telemetry / dashboard ---
 flask>=3.0
 
 # --- Misc existing usage ---
 huggingface-hub>=0.20
 
-# --- New in this upgrade: execution/ live paper-trading layer ---
-scipy>=1.11          # statistical significance tests (walk-forward evaluator, session_report)
-python-dotenv>=1.0   # load exchange API keys from .env — never commit real keys to the repo
+# ==================== OPTIONAL / GPU (DGX tier) ====================
+# Install only if you have a working RAPIDS/CUDA environment already set up.
+# Everything above runs fine (in degraded/CPU/fallback mode) without these.
 
-# --- New in this upgrade: RL training engine (swarm/rl_trainer.py, when built) ---
-stable-baselines3>=2.2   # battle-tested PPO/SAC/DQN — do not hand-roll these from scratch
+# cudf                     # GPU dataframe ops in data_forge -- install via RAPIDS' own instructions, not plain pip
+# nvidia-dali-cuda120      # GPU data loading pipeline (data_forge/dali_loader.py) -- version tag depends on your CUDA version
+# chromadb>=0.4            # vector DB for warden/lineage_vector_db.py; falls back to local index without it
+# pandera[polars]>=0.18    # schema validation for data_forge/schema.py; skipped without it
+# tensorboard>=2.15        # training curve visualization; SB3's stdout/csv logging works without it

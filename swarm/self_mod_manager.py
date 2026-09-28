@@ -74,7 +74,7 @@ class SelfModEngine:
     Backed by `TradeJackModelRegistry` containing all 20+ Stock-Prediction-Models architectures.
     """
 
-    def __init__(self, child_id: int = 0, state_dir: str = "d:/TradeJack/state"):
+    def __init__(self, child_id: int = 0, state_dir: str = "state"):
         self.child_id = child_id
         self.state_dir = os.path.abspath(state_dir)
         self.active_model: Any = None  # v3: model created via OnlineRLTrainer, not directly from registry

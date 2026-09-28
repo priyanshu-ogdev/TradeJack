@@ -151,7 +151,17 @@ def main():
     )
 
     # 2. Run Airgap Validation
-    airgap_result = {"passed": True, "avg_sharpe": 1.25, "max_drawdown": 0.05}
+    # NOTE: the previous default here was {"passed": True, "avg_sharpe": 1.25,
+    # "max_drawdown": 0.05} — a FABRICATED passing result used whenever
+    # --skip-airgap was set. Two real problems with that: (1) promote_weights()
+    # writes this into promotion_log.jsonl, so the log would contain invented
+    # performance numbers indistinguishable from a real evaluation after the
+    # fact; (2) the promotion gate below is `if args.force or
+    # airgap_result.get("passed", False)`, and a fabricated passed=True
+    # satisfies that OR on its own — meaning --skip-airgap ALONE, without
+    # --force, was already silently promoting. An honest "not evaluated" state
+    # that cannot look like a pass is required instead.
+    airgap_result = {"passed": False, "avg_sharpe": None, "max_drawdown": None, "note": "airgap_skipped_not_evaluated"}
     if not args.skip_airgap:
         logger.info(f"Evaluating candidate weights through ValidationAirgapEngine...")
         airgap = ValidationAirgapEngine(
@@ -162,11 +172,19 @@ def main():
         )
         airgap_result = airgap.evaluate_candidate_weights(cand_path, model_type=args.model)
         logger.info(f"Airgap results: {json.dumps(airgap_result, indent=2)}")
+    else:
+        logger.warning(
+            "Airgap validation SKIPPED (--skip-airgap). airgap_result.passed is forced False — "
+            "promotion will only proceed if --force is also passed explicitly."
+        )
 
     # 3. Promotion Gate
-    if args.force or airgap_result.get("passed", False):
+    if airgap_result.get("passed", False) or (args.skip_airgap and args.force):
         promote_weights(cand_path, args.model, args.state_dir, airgap_result)
         logger.info("Train & Promote Pipeline finished successfully.")
+    elif args.force and not args.skip_airgap:
+        logger.warning("--force set but airgap was actually run and FAILED — promoting anyway per explicit --force.")
+        promote_weights(cand_path, args.model, args.state_dir, airgap_result)
     else:
         logger.warning("Airgap criteria not met. Skipping promotion unless --force is specified.")
 

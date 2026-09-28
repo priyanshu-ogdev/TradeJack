@@ -20,7 +20,7 @@ class PortfolioAccountingEngine:
     def __init__(
         self,
         child_id: int = 0,
-        state_dir: str = "d:/TradeJack/state",
+        state_dir: str = "state",
         initial_cash: float = 10.0,
         risk_free_rate_annual: float = 0.04,
         ticks_per_year: float = 365.0 * 1440.0,
