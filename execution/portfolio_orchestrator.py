@@ -30,6 +30,9 @@ reason execution/live_composer.py's toxicity auto-load took a
 toxicity_table_builder dependency instead of hardcoding TrainingTableBuilder.
 """
 
+import os
+import json
+import time
 import logging
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Protocol, Tuple
@@ -137,10 +140,18 @@ class PortfolioOrchestrator:
         allocator: PortfolioAllocator,
         instrument_sources: Dict[str, InstrumentSource],
         vol_tracker: Optional[VolatilityCorrelationTracker] = None,
+        state_path: Optional[str] = None,
     ):
         self.allocator = allocator
         self.instrument_sources = instrument_sources
         self.vol_tracker = vol_tracker or VolatilityCorrelationTracker()
+        # Where run_cycle() persists its latest result -- same "write current
+        # state to a plain JSON file, read it back without needing a live
+        # instance" pattern as RiskGuardian.read_active_halt(), so the
+        # dashboard (or anything else) can show the current allocation without
+        # holding a reference to a live PortfolioOrchestrator. None disables
+        # persistence entirely (e.g. for tests that don't want file I/O).
+        self.state_path = state_path
 
     def run_cycle(self) -> OrchestratorCycleResult:
         """One allocation cycle: update volatility tracking from each source's
@@ -177,4 +188,51 @@ class PortfolioOrchestrator:
 
         correlations = self.vol_tracker.correlation_matrix()
         decisions = self.allocator.allocate(signals, correlation_matrix=correlations)
-        return OrchestratorCycleResult(decisions=decisions, signals=signals, correlation_matrix=correlations)
+        result = OrchestratorCycleResult(decisions=decisions, signals=signals, correlation_matrix=correlations)
+        if self.state_path:
+            self._persist(result)
+        return result
+
+    def _persist(self, result: OrchestratorCycleResult) -> None:
+        """Writes the current allocation to self.state_path as plain JSON --
+        never raises (a persistence failure must not take down the allocation
+        loop itself, same discipline as RiskGuardian._fire_alert)."""
+        payload = {
+            "generated_at": time.time(),
+            "decisions": [
+                {
+                    "instrument": d.instrument,
+                    "role": d.role,
+                    "target_capital_fraction": d.target_capital_fraction,
+                    "opportunity_score": d.opportunity_score,
+                    "reason": d.reason,
+                }
+                for d in result.decisions
+            ],
+            "correlation_matrix": {f"{a}|{b}": v for (a, b), v in result.correlation_matrix.items()},
+        }
+        try:
+            state_dir = os.path.dirname(self.state_path)
+            if state_dir:
+                os.makedirs(state_dir, exist_ok=True)
+            tmp_path = self.state_path + ".tmp"
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(payload, f, indent=2)
+            os.replace(tmp_path, self.state_path)
+        except OSError as e:
+            logger.error(f"Failed to persist portfolio allocation state ({self.state_path}): {e}")
+
+    @staticmethod
+    def read_latest_allocation(state_path: str = "state/PORTFOLIO_ALLOCATION.json") -> Optional[dict]:
+        """Reads the persisted allocation without needing a live
+        PortfolioOrchestrator instance -- for a dashboard or monitoring script
+        to poll. Returns None (not an error) if nothing has been persisted
+        yet, matching RiskGuardian.read_active_halt()'s convention."""
+        if not os.path.exists(state_path):
+            return None
+        try:
+            with open(state_path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except (OSError, json.JSONDecodeError) as e:
+            logger.error(f"Failed to read portfolio allocation state ({state_path}): {e}")
+            return None

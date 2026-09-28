@@ -56,6 +56,22 @@ from flask import Flask, jsonify, request, render_template
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] (Dashboard) %(message)s")
 logger = logging.getLogger("Dashboard")
 
+# NOTE: the primary, recommended UI for this project is now
+# frontend/control-panel/ (Vite + React), talking to the separate FastAPI
+# process in execution/control_panel_api.py (WebSocket push, start/stop
+# controls, promotion approval). This Flask app is the older, lighter-weight,
+# READ-ONLY telemetry surface -- useful if you want charts/status without
+# running a second Node process, but it does not duplicate control_panel_api's
+# start/stop/approve actions (other than the kill switch, which predates both
+# and every RiskGuardian instance already polls for regardless of which UI
+# engaged it). Reverted to serving the original Jinja template here after an
+# earlier, abandoned attempt at a second, TypeScript-based frontend under
+# dashboard/frontend/ was removed -- that directory never grew past three
+# support files (types.ts/api.ts/a type shim) before the team settled on
+# frontend/control-panel/ instead, and had been left pointed at by this file's
+# static_folder with no index.html actually present, so `/` was silently
+# 404ing. Caught by reviewing this file's own routes against what's actually
+# on disk, not by a bug report.
 app = Flask(__name__)
 
 STATE_DIR = os.path.abspath(os.environ.get("TRADEJACK_STATE_DIR", "state"))
@@ -230,6 +246,35 @@ def api_decisions():
     return jsonify({"decisions": [dict(r) for r in reversed(rows)]})
 
 
+@app.route("/api/risk-halt")
+def api_risk_halt():
+    """Active halt marker written by execution/risk_guardian.py's
+    RiskGuardian._fire_alert() -- exists iff currently halted. Returns
+    {"active": null} rather than 404 when there is no halt, since 'not
+    halted' is the normal state, matching RiskGuardian.read_active_halt()'s
+    own None-means-not-an-error convention."""
+    account_id = request.args.get("account_id", "900")
+    from execution.risk_guardian import RiskGuardian
+    active = RiskGuardian.read_active_halt(os.path.join(_child_dir(int(account_id)), "ACTIVE_HALT.json"))
+    return jsonify({"active": active})
+
+
+@app.route("/api/portfolio")
+def api_portfolio():
+    """Latest PortfolioAllocator decision (Primary/Secondary capital split,
+    correlation matrix), written by execution/portfolio_orchestrator.py's
+    PortfolioOrchestrator.run_cycle() to a plain JSON file -- same
+    read-a-file-with-no-live-instance pattern as /api/status's KILL_SWITCH
+    check. Returns an explicit empty shape (not 404) if nothing has been
+    persisted yet -- the orchestrator not having run yet is a normal state
+    for a paper/dev deployment, not an error."""
+    from execution.portfolio_orchestrator import PortfolioOrchestrator
+    state = PortfolioOrchestrator.read_latest_allocation(os.path.join(STATE_DIR, "PORTFOLIO_ALLOCATION.json"))
+    if state is None:
+        return jsonify({"generated_at": None, "decisions": [], "correlation_matrix": {}})
+    return jsonify(state)
+
+
 # -------------------------------------------------------- exchange (Binance)
 def _get_exchange_adapter():
     """Lazily constructs a BinanceSpotAdapter from env-configured credentials.
@@ -326,73 +371,6 @@ def api_kill_switch():
             os.remove(path)
         logger.warning("Kill switch disengaged via dashboard.")
     return jsonify({"kill_switch_engaged": engage})
-
-
-# --------------------------------------------------------------- control APIs
-#
-# FULL-DESIGN-REVIEW ADDITION: these follow the exact same principle
-# api_kill_switch() above already established -- this dashboard process never
-# executes a control action itself, it only writes a durable command file that
-# whichever process is actually running the trading loop polls and acts on
-# (see execution/command_channel.py, and scripts/genesis_prime.py's run_live()
-# for where it's polled). This keeps the dashboard and the trading loop as
-# fully independent processes: restarting either one never affects the other,
-# and a command that arrives while the trading loop happens to be down simply
-# waits in the commands/ directory until it comes back up, rather than being
-# lost or requiring the dashboard to hold a live reference to it.
-#
-# A separate FastAPI backend (execution/control_panel_api.py) was previously
-# built for these same actions, holding an in-process reference to a live
-# LivePaperInferenceServer/ContinuousTrainer and starting them via
-# asyncio.create_task() inside the API process itself. That was a real design
-# mistake, found during a full-design review: it coupled the control surface
-# to the trading process's lifetime in exactly the way api_kill_switch()
-# above had already deliberately avoided. That file is now deprecated in
-# favor of these routes -- see its own module docstring for the full
-# explanation and the file-based alternative it now also offers.
-from execution.command_channel import issue_command, START_TRADING, STOP_TRADING, START_TRAINING, STOP_TRAINING, RESET_HALT, APPROVE_PROMOTION
-
-
-@app.route("/api/trading/start", methods=["POST"])
-@require_token
-def api_start_trading():
-    issue_command(STATE_DIR, START_TRADING)
-    return jsonify({"ok": True, "command": START_TRADING})
-
-
-@app.route("/api/trading/stop", methods=["POST"])
-@require_token
-def api_stop_trading():
-    issue_command(STATE_DIR, STOP_TRADING)
-    return jsonify({"ok": True, "command": STOP_TRADING})
-
-
-@app.route("/api/training/start", methods=["POST"])
-@require_token
-def api_start_training():
-    issue_command(STATE_DIR, START_TRAINING)
-    return jsonify({"ok": True, "command": START_TRAINING})
-
-
-@app.route("/api/training/stop", methods=["POST"])
-@require_token
-def api_stop_training():
-    issue_command(STATE_DIR, STOP_TRAINING)
-    return jsonify({"ok": True, "command": STOP_TRAINING})
-
-
-@app.route("/api/risk/halt/reset", methods=["POST"])
-@require_token
-def api_reset_halt():
-    issue_command(STATE_DIR, RESET_HALT)
-    return jsonify({"ok": True, "command": RESET_HALT})
-
-
-@app.route("/api/promotions/<int:agent_id>/approve", methods=["POST"])
-@require_token
-def api_approve_promotion(agent_id: int):
-    issue_command(STATE_DIR, APPROVE_PROMOTION, {"agent_id": agent_id})
-    return jsonify({"ok": True, "command": APPROVE_PROMOTION, "agent_id": agent_id})
 
 
 if __name__ == "__main__":

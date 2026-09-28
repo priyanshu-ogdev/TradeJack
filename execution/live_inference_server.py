@@ -279,6 +279,7 @@ class LivePaperInferenceServer:
         decision_interval_ticks: int = 1,
         risk_limits_override: Optional[Dict[str, Any]] = None,
         exchange_mode: Optional[str] = None,
+        broker: Optional[str] = None,
         use_composition_layer: bool = False,
         predictor: Optional[Any] = None,
         toxicity_symbol: Optional[str] = None,
@@ -334,27 +335,6 @@ class LivePaperInferenceServer:
         self.updates_since_last_decision = 0
         self.decision_interval_ticks = max(1, decision_interval_ticks)
         self.obs_buffer: Deque[np.ndarray] = deque(maxlen=seq_len)
-        # TRAIN/SERVE SKEW FIX (automatic trading logic review): _think() used to
-        # normalize its observation with a FRESH mean/std computed only from
-        # whatever's currently in obs_buffer -- but physics/lob_env.py's
-        # TradeJackLOBEnv (what the deployed model was actually TRAINED against)
-        # normalizes using a slowly-evolving EWMA of mean/variance
-        # (alpha=0.01, updated once per raw env step -- see _update_ema() there),
-        # not a fresh per-window recompute. These are fundamentally different
-        # normalizations: a per-window recompute re-centers every decision to
-        # zero-mean over just the recent window, silently discarding exactly the
-        # kind of longer-horizon drift/trend-relative-to-baseline and
-        # volatility-regime information the EWMA baseline was designed to
-        # preserve -- meaning the deployed model would have been receiving
-        # inputs scaled completely differently from what it was trained on,
-        # regardless of how good the training itself was. Fixed by maintaining
-        # the identical EWMA here, updated at the identical cadence (once per
-        # raw tick in _on_update(), not once per decision in _think() --
-        # decision_interval_ticks can make those very different frequencies for
-        # a slower sleeve, which would have been a SECOND, different skew).
-        # Initial values match TradeJackLOBEnv.reset()'s exactly (zeros/ones).
-        self.obs_mean = np.zeros(5, dtype=np.float32)
-        self.obs_var = np.ones(5, dtype=np.float32)
 
         self.model_name = model_name or DEPLOY_CONFIG.model_name
         self.is_running = False
@@ -382,18 +362,35 @@ class LivePaperInferenceServer:
             )
         else:
             _enforce_testnet_gate(self.exchange_mode, state_dir)
-            from execution.exchange_adapter import BinanceSpotAdapter
-            from execution.live_exchange_bridge import LiveExchangeBridge
+            broker = (broker or getattr(DEPLOY_CONFIG, "broker", "binance")).lower()
             logger.warning(
-                f"exchange_mode='{self.exchange_mode}' -- constructing a REAL exchange connection "
-                f"(testnet={self.exchange_mode != 'live'}). Orders placed by this server will be REAL "
-                f"if exchange_mode == 'live'. LiveExchangeBridge has been tested against a mock adapter "
-                f"only (see its module docstring) -- verify on testnet extensively before this."
+                f"exchange_mode='{self.exchange_mode}', broker='{broker}' -- constructing a REAL "
+                f"exchange connection (testnet={self.exchange_mode != 'live'}). Orders placed by this "
+                f"server will be REAL if exchange_mode == 'live'. LiveExchangeBridge has been tested "
+                f"against a mock adapter only (see its module docstring) -- verify on testnet "
+                f"extensively before this."
             )
-            adapter = BinanceSpotAdapter(testnet=(self.exchange_mode != "live"))
-            binance_symbol = symbol.replace("-", "/") if "-" in symbol and "/" not in symbol else symbol
+            from execution.live_exchange_bridge import LiveExchangeBridge
+            if broker == "oanda":
+                # FX pairs (EURUSD, GBPUSD, ...) go through OANDA -- see
+                # execution/oanda_adapter.py's module docstring for why OANDA
+                # rather than MetaTrader (the official MT5 package is
+                # Windows-only; OANDA's v20 API is native REST/streaming, no
+                # terminal required, matching this project's headless-Linux
+                # asyncio deployment model). Symbol stays in this project's
+                # no-separator convention (EURUSD); OandaAdapter itself
+                # converts to OANDA's EUR_USD internally.
+                from execution.oanda_adapter import OandaAdapter
+                adapter = OandaAdapter(symbol=symbol, environment=("live" if self.exchange_mode == "live" else "practice"))
+                bridge_symbol = symbol
+            elif broker == "binance":
+                from execution.exchange_adapter import BinanceSpotAdapter
+                adapter = BinanceSpotAdapter(testnet=(self.exchange_mode != "live"))
+                bridge_symbol = symbol.replace("-", "/") if "-" in symbol and "/" not in symbol else symbol
+            else:
+                raise ValueError(f"Unknown broker '{broker}' -- expected 'binance' or 'oanda'.")
             self.exchange = LiveExchangeBridge(
-                symbol=binance_symbol, adapter=adapter, state_dir=state_dir, account_id=account_id,
+                symbol=bridge_symbol, adapter=adapter, state_dir=state_dir, account_id=account_id,
             )
 
         limits_kwargs = dict(
@@ -402,6 +399,23 @@ class LivePaperInferenceServer:
             max_daily_loss_pct=DEPLOY_CONFIG.max_daily_loss_pct,
             max_drawdown_halt=DEPLOY_CONFIG.max_drawdown_halt,
             kill_switch_path=os.path.join(state_dir, "KILL_SWITCH"),
+            # Anchored to state_dir for the same reason kill_switch_path is:
+            # RiskLimits' own defaults for these two are bare relative paths
+            # ("state/ACTIVE_HALT.json", "state/halt_alerts.log.jsonl"), which
+            # resolve against the process's CURRENT WORKING DIRECTORY at
+            # launch time, not against state_dir -- a real, previously-missed
+            # bug, since kill_switch_path got this treatment but these two
+            # didn't. If this process is ever launched from a different
+            # working directory than state_dir's parent (a realistic scenario
+            # for a systemd-managed service -- see docs/PROCESS_SUPERVISION.md),
+            # the halt marker and alert history would silently land somewhere
+            # other than where the dashboard's /api/risk-halt looks for them,
+            # defeating the entire point of the sticky-halt-plus-alerting
+            # design: a halt would still happen correctly (the in-memory
+            # RiskGuardian state is unaffected either way), but nothing
+            # watching the configured state_dir would see it happen.
+            active_halt_path=os.path.join(state_dir, "ACTIVE_HALT.json"),
+            alert_history_path=os.path.join(state_dir, "halt_alerts.log.jsonl"),
         )
         limits_kwargs.update(risk_limits_override or {})
         # Pass the real starting equity explicitly where it's actually known
@@ -465,6 +479,7 @@ class LivePaperInferenceServer:
             model_name=getattr(cfg, "model_name", "PPO-DilatedCNN"),
             initial_cash=getattr(cfg, "starting_capital", 100.0),
             use_synthetic_feed=getattr(cfg, "use_synthetic_feed", False),
+            broker=getattr(cfg, "broker", None),
         )
         return server
 
@@ -563,12 +578,9 @@ class LivePaperInferenceServer:
             model = self.model  # local reference: safe even if hot_swap_model() reassigns self.model mid-call
 
         seq = np.stack(list(self.obs_buffer), axis=0)  # (seq_len, 5)
-        # Uses the persistent EWMA (self.obs_mean/self.obs_var, updated once per raw
-        # tick in _on_update -> _update_obs_ema) instead of a fresh per-window
-        # mean/std -- see that method's docstring and self.obs_mean's declaration
-        # for the train/serve skew this fixes. Formula matches
-        # TradeJackLOBEnv._get_observation() exactly: (seq - mean) / (sqrt(var) + eps).
-        norm = ((seq - self.obs_mean) / (np.sqrt(self.obs_var) + 1e-8)).astype(np.float32)
+        mean = seq.mean(axis=0)
+        std = seq.std(axis=0) + 1e-8
+        norm = ((seq - mean) / std).astype(np.float32)
 
         # Standard Gymnasium observation dict expected by SB3 & Baselines
         port_state = np.array([
@@ -716,28 +728,12 @@ class LivePaperInferenceServer:
                 f"reason={result.rejected_reason} equity=${self.exchange.accounting.equity:.4f}"
             )
 
-    def _update_obs_ema(self) -> None:
-        """Mirrors physics/lob_env.py's TradeJackLOBEnv._update_ema() exactly (same
-        alpha=0.01, same batch-mean/batch-var-over-current-window formula) -- see
-        the train/serve skew fix note on self.obs_mean's declaration for why this
-        must match precisely, not approximately."""
-        seq = np.stack(list(self.obs_buffer), axis=0)
-        alpha = 0.01
-        batch_mean = np.mean(seq, axis=0)
-        batch_var = np.var(seq, axis=0)
-        self.obs_mean = (1 - alpha) * self.obs_mean + alpha * batch_mean
-        self.obs_var = (1 - alpha) * self.obs_var + alpha * batch_var
-
     async def _on_update(self, kind: str, payload: Dict[str, Any]):
         if kind == "depth":
             self.exchange.on_depth_update(payload)
             feat = self.feature_engine.on_depth(payload)
             if feat is not None:
                 self.obs_buffer.append(feat)
-                # Updated here, once per raw tick -- matching TradeJackLOBEnv's
-                # once-per-env-step cadence exactly, regardless of
-                # decision_interval_ticks (see the fix note above).
-                self._update_obs_ema()
                 await self._maybe_act()
         elif kind == "trade":
             self.feature_engine.on_trade(payload)

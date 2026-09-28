@@ -158,6 +158,44 @@ class TestPortfolioOrchestrator(unittest.TestCase):
         eurusd_decision = [d for d in result.decisions if d.instrument == "EURUSD"][0]
         self.assertEqual(eurusd_decision.role, "inactive", "a source that raises must degrade to ungated, not crash the cycle")
 
+    def test_persistence_round_trip(self):
+        import tempfile, shutil
+        tmp_dir = tempfile.mkdtemp(prefix="portfolio_state_test_")
+        try:
+            state_path = os.path.join(tmp_dir, "PORTFOLIO_ALLOCATION.json")
+            sources = {
+                "EURUSD": _FakeSource(True, 0.03, 0.8, 0.0, self._warm_prices(seed=6)),
+                "GBPUSD": _FakeSource(True, 0.02, 0.7, 0.0, self._warm_prices(seed=7)),
+            }
+            orchestrator = PortfolioOrchestrator(
+                PortfolioAllocator(PortfolioAllocatorConfig(min_dwell_cycles=0)), sources,
+                vol_tracker=VolatilityCorrelationTracker(window=20, min_observations=10),
+                state_path=state_path,
+            )
+            self.assertIsNone(PortfolioOrchestrator.read_latest_allocation(state_path), "nothing persisted yet")
+            for _ in range(len(self._warm_prices())):
+                orchestrator.run_cycle()
+            self.assertTrue(os.path.exists(state_path))
+
+            loaded = PortfolioOrchestrator.read_latest_allocation(state_path)
+            self.assertIsNotNone(loaded)
+            self.assertIn("decisions", loaded)
+            self.assertIn("generated_at", loaded)
+            roles = {d["instrument"]: d["role"] for d in loaded["decisions"]}
+            self.assertIn("primary", roles.values())
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    def test_persistence_disabled_by_default(self):
+        """state_path=None (the default) must never attempt file I/O at all."""
+        sources = {"EURUSD": _FakeSource(True, 0.03, 0.8, 0.0, self._warm_prices(seed=8))}
+        orchestrator = PortfolioOrchestrator(
+            PortfolioAllocator(PortfolioAllocatorConfig(min_dwell_cycles=0)), sources,
+            vol_tracker=VolatilityCorrelationTracker(window=20, min_observations=10),
+        )
+        for _ in range(len(self._warm_prices())):
+            orchestrator.run_cycle()  # must not raise even though no state_path was given
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

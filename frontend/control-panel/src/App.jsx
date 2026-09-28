@@ -7,6 +7,7 @@ import RiskPanel from './components/RiskPanel.jsx'
 import ControlRail from './components/ControlRail.jsx'
 import PendingPromotions from './components/PendingPromotions.jsx'
 import TradeLog from './components/TradeLog.jsx'
+import PortfolioPanel from './components/PortfolioPanel.jsx'
 
 export default function App() {
   const { status: liveStatus, connectionState } = useLiveSocket()
@@ -71,6 +72,8 @@ export default function App() {
           <EquityPanel status={status} equityPoints={equityPoints} />
           <RiskPanel status={status} />
         </div>
+
+        <PortfolioPanel status={status} />
 
         <ControlRail
           status={status}

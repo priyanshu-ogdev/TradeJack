@@ -25,9 +25,19 @@ class DeploymentConfig:
 
     # Exchange mode: paper | testnet | live
     # paper: PaperExchangeAdapter (no real orders)
-    # testnet: BinanceSpotAdapter(testnet=True)
-    # live: BinanceSpotAdapter(testnet=False) — requires testnet evidence
+    # testnet: BinanceSpotAdapter(testnet=True) / OandaAdapter(environment="practice")
+    # live: BinanceSpotAdapter(testnet=False) / OandaAdapter(environment="live") — requires testnet evidence
     exchange_mode: str = "paper"
+
+    # Which real broker to route non-paper orders through: "binance" (crypto
+    # spot, via execution/exchange_adapter.py) or "oanda" (FX, via
+    # execution/oanda_adapter.py). Only consulted when exchange_mode is
+    # "testnet" or "live" -- paper mode never touches a real broker at all.
+    # See oanda_adapter.py's module docstring for why OANDA rather than
+    # MetaTrader: the official MT5 Python package is Windows-only, requiring
+    # a Wine-hosted terminal on Linux; OANDA's v20 API is native REST/
+    # streaming, matching this project's headless-Linux deployment model.
+    broker: str = "binance"
 
     # Market-data feed used to drive decisions. Independent of exchange_mode
     # on purpose: exchange_mode controls where ORDERS go (paper wallet vs a
@@ -82,6 +92,7 @@ class DeploymentConfig:
         assert self.starting_capital > 0
         assert self.exchange_mode in ("paper", "testnet", "live"), \
             f"Invalid exchange_mode: {self.exchange_mode}"
+        assert self.broker in ("binance", "oanda"), f"Invalid broker: {self.broker}"
         assert self.min_weeks_testnet_before_live >= 1
 
 

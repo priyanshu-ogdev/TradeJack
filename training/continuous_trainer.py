@@ -61,7 +61,7 @@ class ContinuousTrainer:
         training_model_name: str = "PPO-DilatedCNN",
         data_store_dir: str = "data_store",
         state_dir: str = "state",
-        deployed_model_path: str = "state/deployed/weights_promoted",
+        deployed_model_path: Optional[str] = None,
         symbol: str = "BTC-USDT",
         train_interval_minutes: float = 30.0,
         timesteps_per_cycle: int = 10000,
@@ -73,7 +73,25 @@ class ContinuousTrainer:
         self.training_model_name = training_model_name
         self.data_store_dir = os.path.abspath(data_store_dir)
         self.state_dir = os.path.abspath(state_dir)
-        self.deployed_model_path = deployed_model_path
+        # Derived from self.state_dir (already made absolute above) rather than
+        # left as its own independently-defaulted bare relative path -- a real
+        # bug found on review: the old default ("state/deployed/weights_promoted")
+        # was never joined with state_dir at all, so overriding state_dir (as
+        # both real call sites -- scripts/genesis_prime.py and
+        # execution/control_panel_api.py -- do, anchoring data_store_dir but NOT
+        # state_dir or this) left this on a bare, CWD-relative path while
+        # state_dir itself correctly became absolute. This path controls
+        # self.inference_server.hot_swap_model(...) -- the actual live-model
+        # swap target -- so the two silently disagreeing is not a cosmetic
+        # issue, it's "which file is actually live" becoming ambiguous.
+        # Explicit deployed_model_path still wins when a caller genuinely wants
+        # it decoupled from state_dir (e.g. a shared model store across
+        # multiple state_dirs) -- this only changes what the DEFAULT derives
+        # from, not what an explicit override can do.
+        self.deployed_model_path = (
+            os.path.abspath(deployed_model_path) if deployed_model_path
+            else os.path.join(self.state_dir, "deployed", "weights_promoted")
+        )
         self.symbol = symbol
         self.train_interval = train_interval_minutes * 60  # Convert to seconds
         self.timesteps_per_cycle = timesteps_per_cycle

@@ -299,8 +299,19 @@ if __name__ == "__main__":
             server = LiveInferenceServer.from_config(config)
 
             # Start continuous trainer in background
+            # data_store_dir AND state_dir both anchored to PROJECT_ROOT --
+            # leaving state_dir on its bare relative default while
+            # data_store_dir was explicitly anchored was the other half of the
+            # bug found on review (see ContinuousTrainer.__init__'s comment on
+            # deployed_model_path): a process launched from any working
+            # directory other than PROJECT_ROOT would have looked for its
+            # promoted-model file and pending-promotion records somewhere
+            # other than intended, even after deployed_model_path was fixed to
+            # derive from state_dir -- deriving correctly from a wrong
+            # default is still wrong.
             trainer = ContinuousTrainer(
                 data_store_dir=os.path.join(PROJECT_ROOT, "data_store"),
+                state_dir=os.path.join(PROJECT_ROOT, "state"),
                 inference_server=server,
             )
 
@@ -345,37 +356,8 @@ if __name__ == "__main__":
 
             stop_task = asyncio.create_task(_wait_for_stop())
 
-            # Command channel poller (full-design review addition): consumes
-            # STOP_TRADING/STOP_TRAINING/RESET_HALT/APPROVE_PROMOTION command
-            # files written by dashboard/telemetry_server.py's control routes.
-            # START_TRADING/START_TRAINING are deliberately NOT handled here --
-            # a process that isn't running can't poll for its own start signal.
-            # Those two are for scripts/process_supervisor.py (or an operator)
-            # to consume by actually spawning this process; see
-            # execution/command_channel.py's module docstring.
-            from execution.command_channel import poll_and_execute, STOP_TRADING, STOP_TRAINING, RESET_HALT, APPROVE_PROMOTION
-
-            command_handlers = {
-                STOP_TRADING: lambda payload: server.stop(),
-                STOP_TRAINING: lambda payload: trainer.stop(),
-                RESET_HALT: lambda payload: server.risk.reset_halt(),
-                APPROVE_PROMOTION: lambda payload: trainer.approve_pending_promotion(payload["agent_id"]),
-            }
-
-            async def _poll_commands():
-                # LivePaperInferenceServer.from_config() doesn't override
-                # state_dir, so the effective value is its own literal default
-                # ("state") -- confirmed by reading that default directly rather
-                # than guessing, since DeploymentConfig itself has no state_dir
-                # field to read this from.
-                while not stop_event.is_set():
-                    poll_and_execute("state", command_handlers)
-                    await asyncio.sleep(2.0)
-
-            command_poll_task = asyncio.create_task(_poll_commands())
-
             done, pending = await asyncio.wait(
-                {inference_task, training_task, stop_task, command_poll_task},
+                {inference_task, training_task, stop_task},
                 return_when=asyncio.FIRST_COMPLETED,
             )
             for task in pending:

@@ -44,12 +44,6 @@ class PortfolioAccountingEngine:
         
         # Time-Dilation Stagnation Tracker
         self.last_hwm_market_timestamp = 0.0
-        # REVIEW FIX (starvation-logic audit): tracks the market_timestamp of this
-        # child's very first record_step() call. Needed to fix apply_survival_tax()'s
-        # base tax -- see that method's docstring in warden/warden_core.py for the
-        # full explanation of why ticks_active alone cannot be converted to elapsed
-        # hours for this data.
-        self.first_market_timestamp = 0.0
         
         # Event-Sourcing Tax Bridge
         self.last_processed_tax_id = 0
@@ -82,7 +76,7 @@ class PortfolioAccountingEngine:
                     tick_id INTEGER PRIMARY KEY, timestamp REAL, cash REAL, equity REAL, 
                     peak_equity REAL, max_drawdown REAL, lifetime_sharpe REAL, 
                     rolling_sortino REAL, ticks_active INTEGER, last_hwm_market_timestamp REAL,
-                    market_timestamp REAL, first_market_timestamp REAL
+                    market_timestamp REAL
                 )
             """)
             conn.execute("""
@@ -108,16 +102,6 @@ class PortfolioAccountingEngine:
                     equity REAL, reason TEXT
                 )
             """)
-            # REVIEW FIX (starvation-logic audit): CREATE TABLE IF NOT EXISTS is a
-            # no-op against an already-existing ledger from before this column was
-            # added -- an ALTER TABLE migration is required for any child that was
-            # spawned before this fix. Wrapped in try/except: SQLite raises if the
-            # column already exists (a fresh ledger created with the new schema
-            # above already has it), which is the expected, harmless case here.
-            try:
-                conn.execute("ALTER TABLE portfolio_state ADD COLUMN first_market_timestamp REAL DEFAULT 0.0")
-            except sqlite3.OperationalError:
-                pass
             conn.commit()
             conn.close()
         except Exception as e:
@@ -167,8 +151,6 @@ class PortfolioAccountingEngine:
         self.ticks_active += 1
         
         # 2. Time-Dilation Stagnation (Market Time High Water Mark)
-        if self.ticks_active == 1:
-            self.first_market_timestamp = market_timestamp
         if self.ticks_active == 1 or self.equity > self.peak_equity:
             self.peak_equity = self.equity
             self.last_hwm_market_timestamp = market_timestamp
@@ -185,7 +167,7 @@ class PortfolioAccountingEngine:
         self.write_queue.put((
             tick_id, time.time(), self.cash, self.equity, self.peak_equity, 
             self.max_drawdown, lt_sharpe, r_sortino, self.ticks_active, 
-            self.last_hwm_market_timestamp, market_timestamp, self.first_market_timestamp
+            self.last_hwm_market_timestamp, market_timestamp
         ))
         
         return {
@@ -216,7 +198,7 @@ class PortfolioAccountingEngine:
                     conn.execute("PRAGMA journal_mode=WAL;")
                     conn.executemany("""
                         INSERT OR REPLACE INTO portfolio_state 
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """, batch)
                     
                     # Read-Only Tax Sourcing

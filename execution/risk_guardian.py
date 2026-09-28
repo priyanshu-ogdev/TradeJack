@@ -29,6 +29,19 @@ class RiskLimits:
     max_drawdown_halt: float = 0.15
     max_orders_per_minute: int = 6
     max_book_staleness_sec: float = 2.0
+    # NOTE: kill_switch_path/active_halt_path/alert_history_path below are bare
+    # relative paths by default, resolving against the process's CURRENT
+    # WORKING DIRECTORY at launch, not any shared "state directory" concept --
+    # there is no resolution logic in this project tying them together. Every
+    # real construction site MUST override all three consistently (see
+    # execution/live_inference_server.py's limits_kwargs:
+    # os.path.join(state_dir, "...") for each). Anchoring only kill_switch_path
+    # while leaving the other two on their bare defaults was a real bug
+    # (caught on review, not a live incident) that silently sent the halt
+    # marker and alert history to a different directory than the rest of a
+    # deployment's state whenever launched from an unexpected working
+    # directory -- defeating the sticky-halt-plus-alerting design's entire
+    # point without anything failing loudly.
     kill_switch_path: str = "state/KILL_SWITCH"   # touch this file to halt trading immediately
     # ── Halt alerting (added: was entirely missing -- a sticky halt with no
     # signal to anyone was functionally indistinguishable from a silent crash) ──

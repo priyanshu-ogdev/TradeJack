@@ -1,33 +1,4 @@
 """
-⚠ DEPRECATED (full-design review) — superseded by dashboard/telemetry_server.py's
-new control routes (/api/trading/start, /api/trading/stop, /api/training/start,
-/api/training/stop, /api/risk/halt/reset, /api/promotions/<id>/approve), which use
-execution/command_channel.py's file-based commands instead of this file's in-process
-AppState holding a live LivePaperInferenceServer/ContinuousTrainer reference started
-via asyncio.create_task() inside the API process itself.
-
-That in-process coupling was a real design mistake, found during a full-design
-review: this project had ALREADY established the right pattern twice over before
-this file existed --
-execution/risk_guardian.py's kill_switch_path ("touch this file to halt trading",
-polled every tick) and training/continuous_trainer.py's pending_promotions/*.json
-files. dashboard/telemetry_server.py's own /api/kill-switch endpoint already
-followed that pattern correctly and says so explicitly in its own docstring: "This
-dashboard doesn't need its own halt mechanism -- it just writes/removes the same
-file the trading loop was already built to check." This file didn't follow that
-same principle for the other control actions, and should have.
-
-Left in place rather than deleted, in case the async/WebSocket shape is wanted for
-something else later, but dashboard/telemetry_server.py + execution/command_channel.py
-is the maintained path going forward. The frontend/control-panel/ React app should be
-re-pointed at dashboard/telemetry_server.py's endpoints (same REST shape for the
-control routes; status/trades/equity would need small adjustments to match that
-dashboard's existing /api/status, /api/trades, /api/equity-curve response shapes) --
-not done in this pass; flagged as the next concrete step in
-docs/FULL_DESIGN_REVIEW.md rather than rushed.
-
---- Original docstring follows, for whichever parts of this file remain useful ---
-
 Control Panel API — the backend the Node/React frontend talks to.
 
 Wraps the REAL, already-built-and-tested trading objects directly (LivePaperInferenceServer,
@@ -191,7 +162,30 @@ def _collect_status() -> Dict[str, Any]:
             "promotion_count": state.trainer.promotion_count,
         }
 
+    out["portfolio"] = _collect_portfolio()
+
     return out
+
+
+def _collect_portfolio() -> Dict[str, Any]:
+    """Reads execution/portfolio_orchestrator.py's persisted allocation state --
+    same file-based, no-live-instance-needed pattern as RiskGuardian's
+    ACTIVE_HALT.json (see PortfolioOrchestrator.read_latest_allocation()'s own
+    docstring). Deliberately NOT constructed from a live PortfolioOrchestrator
+    instance held by this process: nothing in this codebase runs one yet (see
+    that module's own "what this deliberately does NOT do" section) -- an
+    orchestrator, if and when one runs (as its own scheduled loop, wherever
+    that ends up living), writes this file independently, and the control
+    panel just displays whatever's there. Returns an explicit empty shape,
+    never 404/error, when nothing has been persisted -- that's the normal
+    state for a deployment that hasn't wired an orchestrator loop up yet, not
+    a fault."""
+    from execution.portfolio_orchestrator import PortfolioOrchestrator
+    state_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "state", "PORTFOLIO_ALLOCATION.json")
+    data = _safe_call(lambda: PortfolioOrchestrator.read_latest_allocation(state_path), default=None)
+    if data is None:
+        return {"generated_at": None, "decisions": [], "correlation_matrix": {}}
+    return data
 
 
 def _safe_call(fn, default=None):
@@ -242,7 +236,22 @@ async def start_training(_: None = Depends(require_auth)) -> Dict[str, Any]:
     if state.trainer is None:
         state.trainer = ContinuousTrainer(
             data_store_dir=os.path.join(os.path.dirname(os.path.dirname(__file__)), "data_store"),
+            # state_dir anchored the same way, for the same reason
+            # data_store_dir already was -- see genesis_prime.py's matching
+            # comment and ContinuousTrainer.__init__'s deployed_model_path
+            # fix; this was the other real call site with the same gap.
+            state_dir=os.path.join(os.path.dirname(os.path.dirname(__file__)), "state"),
             inference_server=state.server,
+            # MUST match the live server's own symbol -- ContinuousTrainer defaults
+            # to "BTC-USDT" if not given, which silently trained the wrong
+            # instrument whenever DEPLOY_CONFIG.symbol was anything else. This was
+            # harmless while every deployment traded BTC-USDT by convention; it
+            # stopped being harmless the moment this project gained real FX/OANDA
+            # support (execution/oanda_adapter.py) and DEPLOY_CONFIG.symbol could
+            # legitimately be "EURUSD" while training silently kept optimizing a
+            # BTC-USDT model. Caught by reviewing this call against
+            # ContinuousTrainer's actual default, not by a live incident.
+            symbol=state.server.symbol,
         )
 
     state._trainer_task = asyncio.create_task(state.trainer.run_continuous())
