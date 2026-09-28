@@ -20,9 +20,9 @@ running this, see [`docs/WALKTHROUGH.md`](docs/WALKTHROUGH.md).
 
 1. **Trains** three real RL algorithms (PPO, SAC, Dueling DQN) via
    `stable-baselines3` on a limit-order-book simulation (`physics/lob_env.py`),
-   sharing a causal dilated-CNN feature encoder, with real gradient updates —
-   not the toy/evolutionary-only stand-ins earlier versions of this project
-   used.
+   sharing a causal dilated-CNN feature encoder. Alongside the RL agents, it
+   now trains a **Supervised Predictor** (`training/supervised_predictor.py`)
+   to act as a reality-check against RL hallucinations.
 2. **Protects against catastrophic forgetting** with Elastic Weight
    Consolidation computed correctly per-algorithm (log-likelihood Fisher for
    PPO and SAC's actor, TD-loss Fisher for DQN and SAC's critic — not a
@@ -33,24 +33,23 @@ running this, see [`docs/WALKTHROUGH.md`](docs/WALKTHROUGH.md).
    U significance test against buy-and-hold and momentum baselines before any
    checkpoint reaches deployment; the gate fails *closed* if it can't run
    (missing dependency, skipped flag) rather than defaulting to "pass."
-4. **Executes real decisions** against either a paper wallet with realistic
+4. **Composes Signals and Orchestrates Portfolios**: The `LiveComposer`
+   dynamically fuses the RL policy's intent with the supervised predictor's
+   confidence and risk limits (using independent greedy/cautious axes). The
+   `PortfolioOrchestrator` distributes capital dynamically across multiple
+   instruments based on these composed signals and volatility tracking.
+5. **Executes real decisions** against either a paper wallet with realistic
    order-book-depth fills, latency, and fees (`execution/paper_exchange.py`)
    or a real Binance Spot account (`execution/exchange_adapter.py` +
    `execution/live_exchange_bridge.py`) — controlled by one config field
    (`exchange_mode: paper | testnet | live`), with the same risk-guardian
    safety layer (kill switch, position limits, daily-loss halt, drawdown
    halt) in front of both.
-5. **Supports both a fast-reacting scalping sleeve and a slower position/swing
-   sleeve** trading concurrently against one shared live market connection
-   (`execution/multi_sleeve_orchestrator.py`) — see the honest framing on what
-   "high-frequency" actually means over a public REST/WebSocket API in
-   `docs/ARCHITECTURE.md`.
-6. **Shows you what's happening** in a live dashboard
-   (`dashboard/telemetry_server.py`): price with real entry/exit markers,
+6. **Shows you what's happening and lets you control it** in a live **React Control Panel**
+   (`frontend/control-panel` + `dashboard/telemetry_server.py`): price with real entry/exit markers,
    equity curve, per-agent RL training progress, recent risk decisions, and
-   your real Binance balance with a deposit-address lookup — never a
-   fabricated "add funds" button; funding the account is always something you
-   do directly on Binance.
+   your real Binance balance. You can start/stop trading and training via a
+   decoupled, file-based command channel that never blocks the trading process.
 
 ## What it does not do, on purpose
 
@@ -98,20 +97,24 @@ TradeJack/
 ├── training/                   # Orchestrates the RL training engine
 │   ├── crucible_tournament.py  #   Multi-agent PBT tournament across the model roster
 │   ├── continuous_trainer.py   #   Background loop: train -> evaluate -> promote -> hot-swap live model
+│   ├── supervised_predictor.py #   Supervised model for signal composition
 │   └── walk_forward_evaluator.py  # Statistical promotion gate (Mann-Whitney U vs baselines)
 ├── execution/                  # Real and paper trade execution
 │   ├── paper_exchange.py       #   Realistic paper wallet: book-depth fills, latency, real fee schedule
 │   ├── exchange_adapter.py     #   BinanceSpotAdapter: real orders via ccxt, rate-limit aware, Ed25519
 │   ├── live_exchange_bridge.py #   Bridges BinanceSpotAdapter into the same interface the trading loop uses
 │   ├── live_inference_server.py#   The actual decision loop: feed -> model -> risk check -> exchange
+│   ├── composition_layer.py    #   LiveComposer: dynamic signal fusion (RL + Predictor + Risk)
+│   ├── portfolio_orchestrator.py # Distributes capital across instruments
+│   ├── command_channel.py      #   Decoupled file-based command channel for the dashboard
 │   ├── risk_guardian.py        #   Kill switch, position/rate limits, daily-loss and drawdown halts
 │   ├── binance_live_feed.py    #   Real Binance depth+trade WebSocket feed
 │   ├── shared_feed_hub.py      #   One live connection fanned out to multiple sleeves
 │   ├── multi_sleeve_orchestrator.py  # Runs an HFT-scalper + position-swing sleeve concurrently
 │   └── session_report.py       #   P&L / Sharpe / significance report for a session
+├── frontend/control-panel/     #   React frontend for monitoring and control
 ├── dashboard/
-│   ├── telemetry_server.py     #   Flask app, runs as a separate process, reads the same SQLite ledgers
-│   └── templates/index.html    #   Price+entry/exit chart, equity curve, RL progress, balance/deposit
+│   └── telemetry_server.py     #   Flask API backing the React dashboard, uses command channel
 ├── escrow/                     # Validation gate (used by the manual promotion script)
 │   └── validation_airgap.py    #   Multi-split out-of-sample stress test before promotion
 ├── data_forge/                 # Historical/synthetic data ingestion (GPU-accelerated where available)
@@ -119,6 +122,7 @@ TradeJack/
 │                                # docs/project_history.md for current relevance
 ├── scripts/
 │   ├── genesis_prime.py        #   Main orchestrator: --mode crucible | paper | testnet | live
+│   ├── process_supervisor.py   #   Supervisor for live/testnet (handles SIGTERM and restarts)
 │   ├── train_and_promote.py    #   One-shot manual: train -> validate -> promote CLI
 │   └── deploy_config.py        #   DeploymentConfig: exchange_mode, risk limits, testnet gating
 ├── tests/                      # Unit tests (does not yet cover the 3 newest swarm/ modules — see
@@ -140,6 +144,9 @@ TradeJack/
 - **[docs/ESCROW_AND_AIRGAP.md](docs/ESCROW_AND_AIRGAP.md)** — the validation/promotion gate in detail.
 - **[docs/DATA_FORGE.md](docs/DATA_FORGE.md)** — data ingestion pipeline.
 - **[docs/WARDEN_HYPERVISOR.md](docs/WARDEN_HYPERVISOR.md)** — the legacy VRAM-tiering/watchdog subsystem.
+- **[docs/FULL_DESIGN_REVIEW.md](docs/FULL_DESIGN_REVIEW.md)** — details the architecture correction separating the dashboard control plane from the trading loop.
+- **[docs/COMPOSITION_LAYER.md](docs/COMPOSITION_LAYER.md)** — deep dive into dynamic signal sizing and independent greed/caution axes.
+- **[docs/PROCESS_SUPERVISION.md](docs/PROCESS_SUPERVISION.md)** — how the trading process handles graceful shutdown and restarts.
 - **[docs/project_history.md](docs/project_history.md)** — the complete, honest changelog: every bug
   found, how it was found, and how it was verified fixed. Read this if you want to know exactly how
   much to trust any given part of the system.

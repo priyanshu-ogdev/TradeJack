@@ -37,17 +37,21 @@ graph TD
         TOUR["training/crucible_tournament.py<br/>PBT across agents"]
         CONT["training/continuous_trainer.py<br/>train -> evaluate -> promote loop"]
         EVAL["training/walk_forward_evaluator.py<br/>Mann-Whitney U vs baselines"]
+        PRED["training/supervised_predictor.py<br/>Reality-check classifier"]
     end
 
     subgraph "Execution"
-        LIS["execution/live_inference_server.py<br/>feed -> model -> risk -> exchange"]
+        LIS["execution/live_inference_server.py<br/>feed -> model"]
+        COMP["execution/composition_layer.py<br/>LiveComposer: fuses RL + Predictor"]
+        ORCH["execution/portfolio_orchestrator.py<br/>Capital distribution"]
         RISK["execution/risk_guardian.py<br/>kill switch, limits, halts"]
         PAPER["execution/paper_exchange.py"]
         BRIDGE["execution/live_exchange_bridge.py"]
         REAL["execution/exchange_adapter.py<br/>BinanceSpotAdapter"]
     end
 
-    DASH["dashboard/telemetry_server.py<br/>separate process, reads SQLite"]
+    DASH["frontend/control-panel<br/>React + telemetry_server.py"]
+    CMD["execution/command_channel.py<br/>File-based control"]
 
     ENV --> REG --> ENC --> TRAIN
     TRAIN <--> EWC
@@ -55,15 +59,21 @@ graph TD
     TRAIN --> TOUR --> CONT --> EVAL
     EVAL -->|"promote"| LIS
     CONT -->|"per-cycle"| PLAST
+    CONT --> PRED
 
-    LIS --> RISK --> PAPER
+    LIS --> COMP --> ORCH --> RISK
+    RISK --> PAPER
     RISK --> BRIDGE --> REAL
 
     PAPER -.->|"SQLite"| DASH
     BRIDGE -.->|"SQLite"| DASH
     CONT -.->|"training_progress.sqlite"| DASH
+    
+    DASH -.->|"issues commands"| CMD
+    CMD -.->|"polled by"| LIS
 
     style EVAL fill:#198754,stroke:#fff,color:#fff
+    style COMP fill:#fd7e14,stroke:#fff,color:#fff
     style RISK fill:#0d6efd,stroke:#fff,color:#fff
     style REAL fill:#dc3545,stroke:#fff,color:#fff
     style DASH fill:#6f42c1,stroke:#fff,color:#fff
@@ -173,9 +183,15 @@ recently.
 
 ## 5. Execution (`execution/`)
 
-`execution/live_inference_server.py` is the actual decision loop: pull a
-depth update, build features, run the frozen model, check with
-`RiskGuardian`, submit to whichever exchange object was configured.
+`execution/live_inference_server.py` is the main loop: it pulls updates, builds features,
+and runs the frozen models.
+
+**Signal Composition and Orchestration:**
+- `execution/composition_layer.py` (`LiveComposer`): Fuses the RL policy's raw intent with
+  the `SupervisedPredictor`'s confidence score and current risk limits to produce dynamically
+  sized allocations. Uses independent greedy (predictor agreement) and cautious (risk throttle) axes.
+- `execution/portfolio_orchestrator.py`: Takes the composed signals across all active
+  instruments and distributes the capital, enforcing correlation/volatility constraints.
 
 **The exchange is chosen by one field**, `DeploymentConfig.exchange_mode`:
 - `"paper"` → `PaperExchange`: fills by walking real live order-book depth,
@@ -233,15 +249,15 @@ HFT firms can extract.
 
 ## 7. Dashboard (`dashboard/`)
 
-Runs as a **fully separate process** from the trading loop — reads directly
-from the same SQLite ledgers (`fills.sqlite`, `ledger.sqlite`,
-`decisions.sqlite`, `training_progress.sqlite`) rather than holding any
-in-process reference to a running server or orchestrator. This avoids
-asyncio-vs-Flask threading complexity entirely and means either process can
-restart independently. See `docs/DASHBOARD.md` for the full design, security
-posture, and what it can/cannot do (short version: it can show a real
-Binance balance and deposit address; it cannot add or withdraw funds, by
-design, with no code path that could).
+The control plane is now split into a **React frontend** (`frontend/control-panel`) backed by a
+Flask API (`dashboard/telemetry_server.py`). It runs as a **fully separate process** from the trading loop — reading directly
+from the SQLite ledgers (`fills.sqlite`, `ledger.sqlite`, `decisions.sqlite`, `training_progress.sqlite`).
+
+**Decoupled Control**: Instead of holding an in-process reference to the trading server
+(which was a previous design flaw), the dashboard issues commands like `START_TRADING` or `STOP_TRAINING`
+by writing simple JSON files via `execution/command_channel.py`. The trading loop simply polls this
+directory. This means either process can restart entirely independently, and commands safely persist
+if the trading loop is temporarily down. See `docs/FULL_DESIGN_REVIEW.md` and `docs/DASHBOARD.md`.
 
 ## 8. What's genuinely still open
 
